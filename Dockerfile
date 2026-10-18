@@ -59,6 +59,7 @@ ARG NUSQLITE3_PATH
 RUN apk add --no-cache --update \
   tzdata \
   ffmpeg \
+  postgresql-client \
   tini
 
 WORKDIR /app
