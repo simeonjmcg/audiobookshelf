@@ -7,10 +7,12 @@ const nodeGlobals = {
   __dirname: 'readonly',
   clearInterval: 'readonly',
   clearTimeout: 'readonly',
+  clearImmediate: 'readonly',
   console: 'readonly',
   process: 'readonly',
   setInterval: 'readonly',
   setTimeout: 'readonly',
+  setImmediate: 'readonly',
   structuredClone: 'readonly'
 }
 
