@@ -60,6 +60,12 @@ class GcsStorageProvider {
     if (path) {
       const { uri } = this.parsePath(path)
       this._statCache.delete(uri)
+      const prefix = uri.endsWith('/') ? uri : `${uri}/`
+      for (const key of this._statCache.keys()) {
+        if (key.startsWith(prefix)) {
+          this._statCache.delete(key)
+        }
+      }
     } else {
       this._statCache.clear()
     }
@@ -481,6 +487,24 @@ class GcsStorageProvider {
       throw new Error(`[GcsStorageProvider] Refusing to delete root bucket "${bucketName}"`)
     }
 
+    const cleanKey = key.replace(/\/+$/, '')
+    const prefix = `${cleanKey}/`
+
+    // Check if there are objects under this prefix (i.e. it is a directory)
+    const [filesUnderPrefix] = await bucket.getFiles({ prefix, maxResults: 1 })
+    if (filesUnderPrefix.length > 0) {
+      Logger.info(`[GcsStorageProvider] Deleting folder and contents with prefix "${prefix}"`)
+      await bucket.deleteFiles({ prefix, force: true })
+      // Delete directory marker if exists
+      const exactMarker = bucket.file(cleanKey)
+      const [markerExists] = await exactMarker.exists()
+      if (markerExists) {
+        await exactMarker.delete().catch(() => {})
+      }
+      return
+    }
+
+    // Single file or directory marker
     const file = bucket.file(key)
     const [exists] = await file.exists()
     if (exists) {
@@ -488,9 +512,15 @@ class GcsStorageProvider {
       return
     }
 
-    // Delete folder and all contents
-    const prefix = key.endsWith('/') ? key : `${key}/`
-    await bucket.deleteFiles({ prefix, force: true })
+    const cleanFile = bucket.file(cleanKey)
+    const [cleanExists] = await cleanFile.exists()
+    if (cleanExists) {
+      await cleanFile.delete()
+      return
+    }
+
+    // Fallback: deleteFiles with prefix
+    await bucket.deleteFiles({ prefix, force: true }).catch(() => {})
   }
 
   async readFile(path, encoding = null) {

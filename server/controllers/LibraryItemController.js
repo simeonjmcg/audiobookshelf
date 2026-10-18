@@ -1,6 +1,5 @@
 const { Request, Response, NextFunction } = require('express')
 const Path = require('path')
-const fs = require('../libs/fsExtra')
 const cron = require('../libs/nodeCron')
 const uaParserJs = require('../libs/uaParser')
 const Logger = require('../Logger')
@@ -134,7 +133,7 @@ class LibraryItemController {
     await this.handleDeleteLibraryItem(req.libraryItem.id, mediaItemIds, req.libraryItem.libraryId)
     if (hardDelete) {
       Logger.info(`[LibraryItemController] Deleting library item from file system at "${libraryItemPath}"`)
-      await fs.remove(libraryItemPath).catch((error) => {
+      await StorageManager.delete(libraryItemPath).catch((error) => {
         Logger.error(`[LibraryItemController] Failed to delete library item from file system at "${libraryItemPath}"`, error)
       })
     }
@@ -641,7 +640,7 @@ class LibraryItemController {
       await this.handleDeleteLibraryItem(libraryItem.id, mediaItemIds, libraryItem.libraryId)
       if (hardDelete) {
         Logger.info(`[LibraryItemController] Deleting library item from file system at "${libraryItemPath}"`)
-        await fs.remove(libraryItemPath).catch((error) => {
+        await StorageManager.delete(libraryItemPath).catch((error) => {
           Logger.error(`[LibraryItemController] Failed to delete library item from file system at "${libraryItemPath}"`, error)
         })
       }

@@ -132,7 +132,7 @@ class PodcastManager {
       success = await this.scanAddPodcastEpisodeAudioFile()
       if (!success) {
         Logger.error(`[PodcastManager] Failed to scan and add podcast episode audio file - removing file`)
-        await fs.remove(this.currentDownload.targetPath)
+        await removeFile(this.currentDownload.targetPath)
       }
     }
 
