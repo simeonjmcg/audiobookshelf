@@ -73,11 +73,13 @@ class CacheManager {
 
     // Cached cover does not exist, generate it
     const coverPath = await Database.libraryItemModel.getCoverPath(libraryItemId)
-    if (!coverPath || !(await fs.pathExists(coverPath))) {
+    const CoverManager = require('./CoverManager')
+    const localCoverPath = await CoverManager.getLocalCoverPath(libraryItemId, coverPath)
+    if (!localCoverPath) {
       return res.sendStatus(404)
     }
 
-    const writtenFile = await resizeImage(coverPath, cachePath, width, height)
+    const writtenFile = await resizeImage(localCoverPath, cachePath, width, height)
     if (!writtenFile) return res.sendStatus(500)
 
     if (global.XAccel) {

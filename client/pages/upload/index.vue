@@ -1,7 +1,14 @@
 <template>
   <div id="page-wrapper" class="page p-1 sm:p-6 overflow-y-auto" :class="streamLibraryItem ? 'streaming' : ''">
     <div class="w-full max-w-6xl mx-auto">
-      <!-- Library & folder picker -->
+      <div v-if="isGlobalUploading" class="w-full flex justify-center py-20">
+        <div class="text-center max-w-xl">
+          <p class="text-2xl mb-4">An upload is currently running in the background.</p>
+          <p class="text-white/70">Please wait for it to finish before starting a new upload.</p>
+        </div>
+      </div>
+      <div v-else>
+        <!-- Library & folder picker -->
       <div class="flex flex-wrap my-6 md:-mx-2">
         <div class="w-full md:w-1/5 px-2">
           <ui-dropdown v-model="selectedLibraryId" :items="libraryItems" :label="$strings.LabelLibrary" :disabled="!!items.length" @input="libraryChanged" />
@@ -81,6 +88,7 @@
         <ui-btn v-if="!uploadFinished" color="bg-success" :loading="processing" @click="submit">{{ $strings.ButtonUpload }}</ui-btn>
         <ui-btn v-else @click="reset">{{ $strings.ButtonReset }}</ui-btn>
       </div>
+      </div>
     </div>
 
     <input ref="fileInput" type="file" multiple :accept="isIOS ? '' : inputAccept" class="hidden" @change="inputChanged" />
@@ -91,6 +99,7 @@
 <script>
 import Path from 'path'
 import uploadHelpers from '@/mixins/uploadHelpers'
+import * as tus from 'tus-js-client'
 
 export default {
   mixins: [uploadHelpers],
@@ -99,6 +108,10 @@ export default {
       isDragging: false,
       error: '',
       items: [],
+      activeUploads: [],
+      totalUploadBytes: 0,
+      completedUploadBytes: 0,
+      currentFileUploadBytes: 0,
       ignoredFiles: [],
       selectedLibraryId: null,
       selectedFolderId: null,
@@ -178,6 +191,12 @@ export default {
     }
   },
   methods: {
+    handleBeforeUnload(e) {
+      if (this.processing) {
+        e.preventDefault()
+        e.returnValue = ''
+      }
+    },
     libraryChanged() {
       if (!this.selectedLibrary && this.selectedFolderId) {
         this.selectedFolderId = null
@@ -290,7 +309,7 @@ export default {
     },
     updateItemCardStatus(index, status) {
       var ref = this.$refs[`itemCard-${index}`]
-      if (ref && ref.length) ref = ref[0]
+      if (Array.isArray(ref)) ref = ref.length ? ref[0] : null
       if (!ref) {
         console.error('Book card ref not found', index, this.$refs)
       } else {
@@ -299,7 +318,7 @@ export default {
     },
     updateItemCardProgress(index, progress) {
       var ref = this.$refs[`itemCard-${index}`]
-      if (ref && ref.length) ref = ref[0]
+      if (Array.isArray(ref)) ref = ref.length ? ref[0] : null
       if (!ref) {
         console.error('Book card ref not found', index, this.$refs)
       } else {
@@ -307,40 +326,78 @@ export default {
       }
     },
     async uploadItem(item) {
-      var form = new FormData()
-      form.set('title', item.title)
-      if (!this.selectedLibraryIsPodcast) {
-        form.set('author', item.author || '')
-        form.set('series', item.series || '')
-      }
-      form.set('library', this.selectedLibraryId)
-      form.set('folder', this.selectedFolderId)
 
-      var index = 0
-      item.files.forEach((file) => {
-        form.set(`${index++}`, file)
-      })
+      
+      let success = true
 
-      const config = {
-        onUploadProgress: (progressEvent) => {
-          if (progressEvent.lengthComputable) {
-            const progress = {
-              loaded: progressEvent.loaded,
-              total: progressEvent.total
+      for (const file of item.files) {
+        const metadata = {
+          filename: file.name,
+          filetype: file.type,
+          title: item.title || '',
+          library: this.selectedLibraryId || '',
+          folder: this.selectedFolderId || ''
+        }
+        if (!this.selectedLibraryIsPodcast) {
+          metadata.author = item.author || ''
+          metadata.series = item.series || ''
+        }
+
+        const successForFile = await new Promise((resolve) => {
+          const uploadOpts = {
+            endpoint: '/api/upload/tus',
+            fingerprint: function(file, options) {
+              return Promise.resolve(['tus-abs', file.name, file.size, options.endpoint].join('-'))
+            },
+            retryDelays: [0, 3000, 5000, 10000, 20000],
+            metadata,
+            headers: {
+              Authorization: `Bearer ${this.$store.getters['user/getToken']}`
+            },
+            onError: (error) => {
+              console.error('Failed to upload file', file.name, error)
+              this.$toast.error(`Failed to upload ${file.name}: ${error.message}`)
+              resolve(false)
+            },
+            onProgress: (bytesUploaded, bytesTotal) => {
+              const progress = {
+                loaded: bytesUploaded,
+                total: bytesTotal
+              }
+              this.updateItemCardProgress(item.index, progress)
+              this.currentFileUploadBytes = bytesUploaded
+              const overallProgress = Math.round(((this.completedUploadBytes + bytesUploaded) / this.totalUploadBytes) * 100)
+              this.$store.commit('globals/setGlobalUploadProgress', overallProgress)
+            },
+            onSuccess: () => {
+              this.completedUploadBytes += file.size
+              this.currentFileUploadBytes = 0
+              this.$store.commit('globals/setGlobalUploadProgress', Math.round((this.completedUploadBytes / this.totalUploadBytes) * 100))
+              resolve(true)
             }
-            this.updateItemCardProgress(item.index, progress)
           }
+
+          if (file.size > 400 * 1024 * 1024) {
+            uploadOpts.chunkSize = 100 * 1024 * 1024
+          }
+
+          const upload = new tus.Upload(file, uploadOpts)
+          this.activeUploads.push(upload)
+
+          upload.findPreviousUploads().then((previousUploads) => {
+            if (previousUploads.length) {
+              upload.resumeFromPreviousUpload(previousUploads[0])
+            }
+            upload.start()
+          })
+        })
+
+        if (!successForFile) {
+          success = false
         }
       }
 
-      return this.$axios
-        .$post('/api/upload', form, config)
-        .then(() => true)
-        .catch((error) => {
-          console.error('Failed to upload item', error)
-          this.$toast.error(error.response?.data || 'Oops, something went wrong...')
-          return false
-        })
+      return success
     },
     validateItems() {
       var itemData = []
@@ -401,6 +458,15 @@ export default {
         }
       }
 
+      this.totalUploadBytes = 0
+      this.completedUploadBytes = 0
+      for (const item of itemsToUpload) {
+        for (const file of item.files) {
+          this.totalUploadBytes += file.size
+        }
+      }
+      this.$store.commit('globals/setIsGlobalUploading', true)
+
       for (const item of itemsToUpload) {
         this.updateItemCardStatus(item.index, 'uploading')
         const result = await this.uploadItem(item)
@@ -408,6 +474,8 @@ export default {
       }
       this.processing = false
       this.uploadFinished = true
+      this.$store.commit('globals/setIsGlobalUploading', false)
+      this.$store.commit('globals/setGlobalUploadProgress', 0)
     }
   },
   mounted() {
@@ -421,12 +489,51 @@ export default {
     window.addEventListener('dragleave', this.dragleave)
     window.addEventListener('dragover', this.dragover)
     window.addEventListener('drop', this.drop)
+    window.addEventListener('beforeunload', this.handleBeforeUnload)
+  },
+  beforeRouteLeave(to, from, next) {
+    if (this.processing) {
+      this.$store.commit('globals/setConfirmPrompt', {
+        type: 'yesNo',
+        persistent: true,
+        message: 'You have an active upload. Do you want to continue it in the background?',
+        yesButtonText: 'Continue in background',
+        yesButtonColor: 'success',
+        callback: (confirmed) => {
+          if (confirmed) {
+            this.$toast.info('Upload continuing in background')
+            next()
+          } else {
+            this.activeUploads.forEach((u) => { if (u.abort) u.abort() })
+            this.activeUploads = []
+            this.processing = false
+            this.$store.commit('globals/setIsGlobalUploading', false)
+            this.$store.commit('globals/setGlobalUploadProgress', 0)
+            next()
+          }
+        }
+      })
+    } else {
+      next()
+    }
   },
   beforeDestroy() {
     window.removeEventListener('dragenter', this.dragenter)
     window.removeEventListener('dragleave', this.dragleave)
     window.removeEventListener('dragover', this.dragover)
     window.removeEventListener('drop', this.drop)
+    window.removeEventListener('beforeunload', this.handleBeforeUnload)
+
+    if (this.processing) {
+      if (this.$refs.fileInput) {
+        this.$refs.fileInput.style.display = 'none'
+        document.body.appendChild(this.$refs.fileInput)
+      }
+      if (this.$refs.fileFolderInput) {
+        this.$refs.fileFolderInput.style.display = 'none'
+        document.body.appendChild(this.$refs.fileFolderInput)
+      }
+    }
   }
 }
 </script>

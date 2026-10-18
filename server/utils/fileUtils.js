@@ -38,7 +38,14 @@ function isSameOrSubPath(parentPath, childPath) {
 }
 module.exports.isSameOrSubPath = isSameOrSubPath
 
-function getFileStat(path) {
+const isGcsPath = (path) => typeof path === 'string' && (path.startsWith('gcs:') || path.startsWith('gs:'))
+module.exports.isGcsPath = isGcsPath
+
+async function getFileStat(path) {
+  if (isGcsPath(path)) {
+    const StorageManager = require('../storage/StorageManager')
+    return StorageManager.stat(path)
+  }
   try {
     return fs.stat(path)
   } catch (err) {
@@ -48,6 +55,11 @@ function getFileStat(path) {
 }
 
 async function getFileTimestampsWithIno(path) {
+  if (isGcsPath(path)) {
+    const StorageManager = require('../storage/StorageManager')
+    const gcsProvider = StorageManager.getProvider(path)
+    return gcsProvider.getFileTimestampsWithIno(path)
+  }
   try {
     var stat = await fs.stat(path, { bigint: true })
     return {
@@ -95,6 +107,11 @@ module.exports.getFileMTimeMs = async (path) => {
  * @returns {boolean}
  */
 async function checkPathIsFile(filepath) {
+  if (isGcsPath(filepath)) {
+    const StorageManager = require('../storage/StorageManager')
+    const stat = await StorageManager.stat(filepath)
+    return stat?.isFile || false
+  }
   try {
     const stat = await fs.stat(filepath)
     return stat.isFile()
@@ -105,6 +122,11 @@ async function checkPathIsFile(filepath) {
 module.exports.checkPathIsFile = checkPathIsFile
 
 function getIno(path) {
+  if (isGcsPath(path)) {
+    const StorageManager = require('../storage/StorageManager')
+    const gcsProvider = StorageManager.getProvider(path)
+    return gcsProvider.getIno(path)
+  }
   return fs
     .stat(path, { bigint: true })
     .then((data) => String(data.ino))
@@ -121,6 +143,10 @@ module.exports.getIno = getIno
  * @returns {string}
  */
 async function readTextFile(path) {
+  if (isGcsPath(path)) {
+    const StorageManager = require('../storage/StorageManager')
+    return StorageManager.readFile(path, 'utf8')
+  }
   try {
     var data = await fs.readFile(path)
     return String(data)
@@ -182,6 +208,12 @@ module.exports.shouldIgnoreFile = (path) => {
  * @returns {FilePathItem[]}
  */
 module.exports.recurseFiles = async (path, relPathToReplace = null) => {
+  if (isGcsPath(path)) {
+    const StorageManager = require('../storage/StorageManager')
+    const gcsProvider = StorageManager.getProvider(path)
+    return gcsProvider.recurseFiles(path, relPathToReplace)
+  }
+
   path = filePathToPOSIX(path)
   if (!path.endsWith('/')) path = path + '/'
 
@@ -428,8 +460,12 @@ module.exports.getAudioMimeTypeFromExtname = (extname) => {
   return null
 }
 
-module.exports.removeFile = (path) => {
+module.exports.removeFile = async (path) => {
   if (!path) return false
+  if (isGcsPath(path)) {
+    const StorageManager = require('../storage/StorageManager')
+    return StorageManager.delete(path)
+  }
   return fs
     .remove(path)
     .then(() => true)
@@ -455,6 +491,7 @@ module.exports.encodeUriPath = (path) => {
  * @returns {Promise<boolean>}
  */
 module.exports.isWritable = async (directory) => {
+  if (isGcsPath(directory)) return true
   try {
     const accessTestFile = Path.join(directory, 'accessTest')
     await fs.writeFile(accessTestFile, '')

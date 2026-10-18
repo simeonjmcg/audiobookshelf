@@ -80,6 +80,11 @@
         </ui-tooltip>
       </div>
     </div>
+
+    <!-- Global Upload Progress Bar -->
+    <div v-if="isGlobalUploading && $route.name !== 'upload'" class="absolute bottom-0 left-0 w-full h-1 bg-bg z-50 overflow-hidden pointer-events-none">
+      <div class="h-full bg-success transition-all duration-300" :style="{ width: globalUploadProgress + '%' }" />
+    </div>
   </div>
 </template>
 
@@ -91,6 +96,12 @@ export default {
     }
   },
   computed: {
+    isGlobalUploading() {
+      return this.$store.state.globals.isGlobalUploading
+    },
+    globalUploadProgress() {
+      return this.$store.state.globals.globalUploadProgress
+    },
     currentLibrary() {
       return this.$store.getters['libraries/getCurrentLibrary']
     },

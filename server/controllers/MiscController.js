@@ -11,11 +11,14 @@ const libraryItemFilters = require('../utils/queries/libraryItemFilters')
 const cron = require('../libs/nodeCron')
 const { isObject, getTitleIgnorePrefix } = require('../utils/index')
 const ServerSettings = require('../objects/settings/ServerSettings')
-const { sanitizeFilename } = require('../utils/fileUtils')
+const { sanitizeFilename, filePathToPOSIX } = require('../utils/fileUtils')
 const { sanitize } = require('../utils/htmlSanitizer')
 
 const TaskManager = require('../managers/TaskManager')
 const adminStats = require('../utils/queries/adminStats')
+const { Server: TusServer } = require('@tus/server')
+const { FileStore: TusFileStore } = require('@tus/file-store')
+const StorageManager = require('../storage/StorageManager')
 
 /**
  * @typedef RequestUserObject
@@ -25,7 +28,142 @@ const adminStats = require('../utils/queries/adminStats')
  */
 
 class MiscController {
-  constructor() {}
+  constructor() {
+    this.tusServer = null
+  }
+
+  initTusServer() {
+    if (this.tusServer) return
+
+    const uploadDir = Path.join(global.MetadataPath, 'tmp', 'tus')
+    fs.ensureDirSync(uploadDir)
+
+    this.tusServer = new TusServer({
+      path: '/api/upload/tus',
+      datastore: new TusFileStore({ directory: uploadDir }),
+      respectForwardedHeaders: true,
+      onUploadCreate: async (req, upload) => {
+        const expressReq = req.node?.req || req
+        if (!expressReq.user || !expressReq.user.canUpload) {
+          throw { status_code: 403, body: 'Forbidden' }
+        }
+
+        const metadata = upload.metadata || {}
+        const { title, folder: folderId, library: libraryId } = metadata
+        if (!libraryId || !folderId || !title) {
+          throw { status_code: 400, body: 'Invalid request body' }
+        }
+
+        const library = await Database.libraryModel.findByIdWithFolders(libraryId)
+        if (!library) {
+          throw { status_code: 404, body: 'Library not found' }
+        }
+
+        if (!expressReq.user.checkCanAccessLibrary(library.id)) {
+          Logger.error(`[MiscController] User "${expressReq.user.username}" attempting to upload to library "${library.id}" without access`)
+          throw { status_code: 403, body: 'Forbidden' }
+        }
+
+        const folder = library.libraryFolders.find((fold) => fold.id === folderId)
+        if (!folder) {
+          throw { status_code: 404, body: 'Folder not found' }
+        }
+
+        return {}
+      },
+      onUploadFinish: async (req, upload) => {
+        try {
+          const metadata = upload.metadata || {}
+          const { title, author, series, folder: folderId, library: libraryId, filename } = metadata
+          const library = await Database.libraryModel.findByIdWithFolders(libraryId)
+          const folder = library.libraryFolders.find((fold) => fold.id === folderId)
+
+          const isGcs = StorageManager.isGcsPath(folder.path)
+          const outputDirectoryParts = library.isPodcast ? [title] : [author, series, title]
+          const cleanedOutputDirectoryParts = outputDirectoryParts.filter(Boolean).map((part) => sanitizeFilename(part))
+          const outputDirectory = StorageManager.join(folder.path, ...cleanedOutputDirectoryParts)
+
+          const filePath = StorageManager.join(outputDirectory, sanitizeFilename(filename))
+
+          const uploadId = upload.id
+          const tempFilePath = Path.join(uploadDir, uploadId)
+
+          setImmediate(async () => {
+            try {
+              if (isGcs) {
+                const gcsProvider = StorageManager.getProvider(filePath)
+                const { bucketName, key } = gcsProvider.parsePath(filePath)
+                Logger.info(`[MiscController] Tus upload finished: uploading to gs://${bucketName}/${key}`)
+                await gcsProvider.getBucket(bucketName).upload(tempFilePath, {
+                  destination: key
+                })
+                await fs.remove(tempFilePath).catch(() => {})
+                await fs.remove(tempFilePath + '.info').catch(() => {})
+                Logger.info(`[MiscController] Tus upload finished: uploaded to ${filePath}`)
+              } else {
+                const hiddenFilePath = Path.join(outputDirectory, `.${sanitizeFilename(filename)}.tmp`)
+                await fs.ensureDir(outputDirectory)
+                await fs.move(tempFilePath, hiddenFilePath, { overwrite: true })
+                await fs.rename(hiddenFilePath, filePath)
+
+                // remove .info file created by tus
+                await fs.remove(tempFilePath + '.info').catch(() => {})
+                Logger.info(`[MiscController] Tus upload finished: moved to ${filePath}`)
+              }
+
+              // Manually trigger watcher since chokidar can miss hidden file renames across filesystems
+              if (Watcher.onFileAdded) {
+                Watcher.onFileAdded(libraryId, filePathToPOSIX(filePath))
+              }
+            } catch (error) {
+              Logger.error('[MiscController] Error moving/uploading finished tus upload', error)
+            }
+          })
+        } catch (error) {
+          Logger.error('[MiscController] Error starting background file move', error)
+        }
+        return {}
+      }
+    })
+  }
+
+  handleTusUpload(req, res) {
+    this.initTusServer()
+
+    const originalWriteHead = res.writeHead
+    res.writeHead = function(statusCode, statusMessage, headers) {
+      let _headers = headers
+      let _statusMessage = statusMessage
+
+      if (Array.isArray(statusMessage) || (typeof statusMessage === 'object' && statusMessage !== null)) {
+        _headers = statusMessage
+        _statusMessage = undefined
+      }
+
+      if (Array.isArray(_headers) && _headers.length > 0 && typeof _headers[0] === 'string') {
+        const obj = {}
+        for (let i = 0; i < _headers.length; i += 2) {
+          const key = _headers[i]
+          const val = _headers[i + 1]
+          if (obj[key] !== undefined) {
+            if (Array.isArray(obj[key])) obj[key].push(val)
+            else obj[key] = [obj[key], val]
+          } else {
+            obj[key] = val
+          }
+        }
+        _headers = obj
+      }
+
+      if (_statusMessage !== undefined) {
+        return originalWriteHead.call(this, statusCode, _statusMessage, _headers)
+      } else {
+        return originalWriteHead.call(this, statusCode, _headers)
+      }
+    }
+
+    return this.tusServer.handle(req, res)
+  }
 
   /**
    * POST: /api/upload
@@ -73,34 +211,47 @@ class MiscController {
     }
 
     // Podcasts should only be one folder deep
+    const isGcs = StorageManager.isGcsPath(folder.path)
     const outputDirectoryParts = library.isPodcast ? [title] : [author, series, title]
     // `.filter(Boolean)` to strip out all the potentially missing details (eg: `author`)
     // before sanitizing all the directory parts to remove illegal chars and finally prepending
     // the base folder path
     const cleanedOutputDirectoryParts = outputDirectoryParts.filter(Boolean).map((part) => sanitizeFilename(part))
-    const outputDirectory = Path.join(...[folder.path, ...cleanedOutputDirectoryParts])
+    const outputDirectory = StorageManager.join(folder.path, ...cleanedOutputDirectoryParts)
 
-    try {
-      await fs.ensureDir(outputDirectory)
-    } catch (error) {
-      Logger.error('[MiscController] Failed to create upload directory', outputDirectory, error)
-      return res.sendStatus(500)
+    if (!isGcs) {
+      try {
+        await fs.ensureDir(outputDirectory)
+      } catch (error) {
+        Logger.error('[MiscController] Failed to create upload directory', outputDirectory, error)
+        return res.sendStatus(500)
+      }
     }
 
     Logger.info(`Uploading ${files.length} files to`, outputDirectory)
 
     for (const file of files) {
-      const path = Path.join(outputDirectory, sanitizeFilename(file.name))
+      const path = StorageManager.join(outputDirectory, sanitizeFilename(file.name))
 
-      await file
-        .mv(path)
-        .then(() => {
-          return true
+      if (isGcs) {
+        const gcsProvider = StorageManager.getProvider(path)
+        const { bucketName, key } = gcsProvider.parsePath(path)
+        await gcsProvider.getBucket(bucketName).upload(file.tempFilePath || file.path, {
+          destination: key
+        }).catch((error) => {
+          Logger.error('Failed to upload file to GCS', path, error)
         })
-        .catch((error) => {
-          Logger.error('Failed to move file', path, error)
-          return false
-        })
+      } else {
+        await file
+          .mv(path)
+          .then(() => {
+            return true
+          })
+          .catch((error) => {
+            Logger.error('Failed to move file', path, error)
+            return false
+          })
+      }
     }
 
     res.sendStatus(200)

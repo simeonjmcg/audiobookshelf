@@ -15,7 +15,9 @@ class CoverManager {
   constructor() {}
 
   getCoverDirectory(libraryItem) {
-    if (global.ServerSettings.storeCoverWithItem && !libraryItem.isFile) {
+    const StorageManager = require('../storage/StorageManager')
+    const isGcs = libraryItem?.path && StorageManager.isGcsPath(libraryItem.path)
+    if (global.ServerSettings.storeCoverWithItem && !libraryItem.isFile && !isGcs) {
       return libraryItem.path
     } else {
       return Path.posix.join(Path.posix.join(global.MetadataPath, 'items'), libraryItem.id)
@@ -31,8 +33,38 @@ class CoverManager {
     }
   }
 
-  removeFile(filepath) {
+  async getLocalCoverPath(libraryItemId, coverPath) {
+    if (!coverPath) return null
+    const StorageManager = require('../storage/StorageManager')
+    if (!StorageManager.isGcsPath(coverPath)) {
+      return (await fs.pathExists(coverPath)) ? coverPath : null
+    }
+
+    const coverFilename = Path.basename(coverPath) || 'cover.jpg'
+    const metadataCoverPath = Path.join(global.MetadataPath, 'items', libraryItemId, coverFilename)
+    if ((await fs.pathExists(metadataCoverPath)) && (await fs.stat(metadataCoverPath).then((s) => s.size > 0).catch(() => false))) {
+      return metadataCoverPath
+    }
+
     try {
+      await fs.ensureDir(Path.dirname(metadataCoverPath))
+      const gcsProvider = StorageManager.getProvider(coverPath)
+      await gcsProvider.getFile(coverPath).download({ destination: metadataCoverPath })
+      Logger.debug(`[CoverManager] Downloaded cover from GCS to local metadata cache: "${metadataCoverPath}"`)
+      return metadataCoverPath
+    } catch (err) {
+      Logger.error(`[CoverManager] Failed to download cover from GCS "${coverPath}": ${err.message}`)
+      return null
+    }
+  }
+
+  async removeFile(filepath) {
+    try {
+      const StorageManager = require('../storage/StorageManager')
+      if (StorageManager.isGcsPath(filepath)) {
+        const fileUtils = require('../utils/fileUtils')
+        return fileUtils.removeFile(filepath)
+      }
       return fs.pathExists(filepath).then((exists) => {
         if (!exists) Logger.warn(`[CoverManager] Attempting to remove file that does not exist ${filepath}`)
         return exists ? fs.unlink(filepath) : false
@@ -45,6 +77,12 @@ class CoverManager {
 
   // Remove covers that dont have the same filename as the new cover
   async removeOldCovers(dirpath, newCoverExt) {
+    const StorageManager = require('../storage/StorageManager')
+    if (StorageManager.isGcsPath(dirpath)) {
+      // Handled via overwrite on upload
+      return
+    }
+
     var filesInDir = await this.getFilesInDirectory(dirpath)
 
     const imageExtensions = ['.jpeg', '.jpg', '.png', '.webp', '.jiff']
@@ -226,27 +264,70 @@ class CoverManager {
     let audioFileWithCover = audioFiles.find((af) => af.embeddedCoverArt)
     if (!audioFileWithCover) return null
 
-    let coverDirPath = null
-    if (global.ServerSettings.storeCoverWithItem && libraryItemPath) {
-      coverDirPath = libraryItemPath
-    } else {
-      coverDirPath = Path.posix.join(global.MetadataPath, 'items', libraryItemId)
-    }
-    await fs.ensureDir(coverDirPath)
+    const StorageManager = require('../storage/StorageManager')
+    const isGcs = libraryItemPath && StorageManager.isGcsPath(libraryItemPath)
 
     const coverFilename = audioFileWithCover.embeddedCoverArt === 'png' ? 'cover.png' : 'cover.jpg'
-    const coverFilePath = Path.join(coverDirPath, coverFilename)
+    const localCoverDir = Path.posix.join(global.MetadataPath, 'items', libraryItemId)
+    await fs.ensureDir(localCoverDir)
+    const localCoverPath = Path.join(localCoverDir, coverFilename)
 
-    const coverAlreadyExists = await fs.pathExists(coverFilePath)
-    if (coverAlreadyExists) {
-      Logger.warn(`[CoverManager] Extract embedded cover art but cover already exists for "${coverFilePath}" - bail`)
-      return null
+    let finalCoverPath = localCoverPath
+    if (global.ServerSettings.storeCoverWithItem && libraryItemPath) {
+      if (isGcs) {
+        finalCoverPath = StorageManager.join(libraryItemPath, coverFilename)
+      } else {
+        finalCoverPath = Path.join(libraryItemPath, coverFilename)
+      }
     }
 
-    const success = await extractCoverArt(audioFileWithCover.metadata.path, coverFilePath)
+    // Check if cover already exists at destination
+    if (isGcs) {
+      const exists = await StorageManager.pathExists(finalCoverPath).catch(() => false)
+      if (exists) {
+        Logger.info(`[CoverManager] Found existing embedded cover in GCS at "${finalCoverPath}"`)
+        if (!(await fs.pathExists(localCoverPath))) {
+          const gcsProvider = StorageManager.getProvider(finalCoverPath)
+          await gcsProvider.getFile(finalCoverPath).download({ destination: localCoverPath }).catch(() => {})
+        }
+        return finalCoverPath
+      }
+    } else {
+      const coverAlreadyExists = await fs.pathExists(finalCoverPath)
+      if (coverAlreadyExists) {
+        const stat = await fs.stat(finalCoverPath).catch(() => null)
+        if (stat && stat.size > 0) {
+          Logger.info(`[CoverManager] Found existing embedded cover art at "${finalCoverPath}"`)
+          return finalCoverPath
+        }
+        await fs.remove(finalCoverPath).catch(() => {})
+      }
+    }
+
+    const success = await extractCoverArt(audioFileWithCover.metadata.path, localCoverPath)
     if (success) {
+      if (global.ServerSettings.storeCoverWithItem && libraryItemPath) {
+        if (isGcs) {
+          try {
+            const gcsProvider = StorageManager.getProvider(finalCoverPath)
+            const parsed = gcsProvider.parsePath(finalCoverPath)
+            await gcsProvider.getBucket(parsed.bucketName).upload(localCoverPath, {
+              destination: parsed.key
+            })
+            Logger.info(`[CoverManager] Uploaded extracted cover to GCS source of truth at "${finalCoverPath}"`)
+          } catch (uploadErr) {
+            Logger.warn(`[CoverManager] Failed to upload cover to GCS: ${uploadErr.message}`)
+            finalCoverPath = localCoverPath
+          }
+        } else if (finalCoverPath !== localCoverPath) {
+          await fs.copy(localCoverPath, finalCoverPath, { overwrite: true }).catch((err) => {
+            Logger.error(`[CoverManager] Failed to copy cover to "${finalCoverPath}": ${err.message}`)
+          })
+        }
+      }
+
       await CacheManager.purgeCoverCache(libraryItemId)
-      return coverFilePath
+      return finalCoverPath
     }
     return null
   }
@@ -262,29 +343,50 @@ class CoverManager {
   async saveEbookCoverArt(ebookFileScanData, libraryItemId, libraryItemPath) {
     if (!ebookFileScanData?.ebookCoverPath) return null
 
-    let coverDirPath = null
-    if (global.ServerSettings.storeCoverWithItem && libraryItemPath) {
-      coverDirPath = libraryItemPath
-    } else {
-      coverDirPath = Path.posix.join(global.MetadataPath, 'items', libraryItemId)
-    }
-    await fs.ensureDir(coverDirPath)
+    const StorageManager = require('../storage/StorageManager')
+    const isGcs = libraryItemPath && StorageManager.isGcsPath(libraryItemPath)
 
     let extname = Path.extname(ebookFileScanData.ebookCoverPath) || '.jpg'
     if (extname === '.jpeg') extname = '.jpg'
     const coverFilename = `cover${extname}`
-    const coverFilePath = Path.join(coverDirPath, coverFilename)
 
-    // TODO: Overwrite if exists?
-    const coverAlreadyExists = await fs.pathExists(coverFilePath)
-    if (coverAlreadyExists) {
-      Logger.warn(`[CoverManager] Extract embedded cover art but cover already exists for "${coverFilePath}" - overwriting`)
+    const localCoverDir = Path.posix.join(global.MetadataPath, 'items', libraryItemId)
+    await fs.ensureDir(localCoverDir)
+    const localCoverPath = Path.join(localCoverDir, coverFilename)
+
+    let finalCoverPath = localCoverPath
+    if (global.ServerSettings.storeCoverWithItem && libraryItemPath) {
+      if (isGcs) {
+        finalCoverPath = StorageManager.join(libraryItemPath, coverFilename)
+      } else {
+        finalCoverPath = Path.join(libraryItemPath, coverFilename)
+      }
     }
 
-    const success = await parseEbookMetadata.extractCoverImage(ebookFileScanData, coverFilePath)
+    const success = await parseEbookMetadata.extractCoverImage(ebookFileScanData, localCoverPath)
     if (success) {
+      if (global.ServerSettings.storeCoverWithItem && libraryItemPath) {
+        if (isGcs) {
+          try {
+            const gcsProvider = StorageManager.getProvider(finalCoverPath)
+            const parsed = gcsProvider.parsePath(finalCoverPath)
+            await gcsProvider.getBucket(parsed.bucketName).upload(localCoverPath, {
+              destination: parsed.key
+            })
+            Logger.info(`[CoverManager] Uploaded ebook cover to GCS at "${finalCoverPath}"`)
+          } catch (uploadErr) {
+            Logger.warn(`[CoverManager] Failed to upload ebook cover to GCS: ${uploadErr.message}`)
+            finalCoverPath = localCoverPath
+          }
+        } else if (finalCoverPath !== localCoverPath) {
+          await fs.copy(localCoverPath, finalCoverPath, { overwrite: true }).catch((err) => {
+            Logger.error(`[CoverManager] Failed to copy cover to "${finalCoverPath}": ${err.message}`)
+          })
+        }
+      }
+
       await CacheManager.purgeCoverCache(libraryItemId)
-      return coverFilePath
+      return finalCoverPath
     }
     return null
   }
@@ -299,8 +401,11 @@ class CoverManager {
    */
   async downloadCoverFromUrlNew(url, libraryItemId, libraryItemPath, forceLibraryItemFolder = false) {
     try {
+      const StorageManager = require('../storage/StorageManager')
+      const isGcs = libraryItemPath && StorageManager.isGcsPath(libraryItemPath)
+
       let coverDirPath = null
-      if ((global.ServerSettings.storeCoverWithItem || forceLibraryItemFolder) && libraryItemPath) {
+      if ((global.ServerSettings.storeCoverWithItem || forceLibraryItemFolder) && libraryItemPath && !isGcs) {
         coverDirPath = libraryItemPath
       } else {
         coverDirPath = Path.posix.join(global.MetadataPath, 'items', libraryItemId)

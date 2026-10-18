@@ -288,18 +288,14 @@ function parseProbeData(data, verbose = false) {
  * Run ffprobe on audio filepath
  * @param {string} filepath
  * @param {boolean} [verbose=false]
- * @returns {import('../scanner/MediaProbeData')|{error:string}}
+ * @returns {Promise<import('../scanner/MediaProbeData')|{error:string}>}
  */
-function probe(filepath, verbose = false) {
-  if (process.env.FFPROBE_PATH) {
-    ffprobe.FFPROBE_PATH = process.env.FFPROBE_PATH
-  }
-
-  return ffprobe(filepath)
+async function probe(filepath, verbose = false) {
+  return rawProbe(filepath)
     .then((raw) => {
       if (raw.error) {
         return {
-          error: raw.error.string
+          error: raw.error.string || String(raw.error)
         }
       }
 
@@ -328,15 +324,51 @@ module.exports.probe = probe
  * @param {string} filepath
  * @returns {Object} ffprobe json output
  */
-function rawProbe(filepath) {
+async function rawProbe(filepath) {
   if (process.env.FFPROBE_PATH) {
     ffprobe.FFPROBE_PATH = process.env.FFPROBE_PATH
   }
 
-  return ffprobe(filepath).catch((err) => {
+  let probePath = filepath
+  let tempProbePath = null
+
+  if (typeof filepath === 'string' && (filepath.startsWith('gcs:') || filepath.startsWith('gs:'))) {
+    const StorageManager = require('../storage/StorageManager')
+    try {
+      const signedUrl = await StorageManager.getSignedUrl(filepath, { expiryHours: 2 })
+      if (signedUrl) {
+        probePath = signedUrl
+      }
+    } catch (err) {
+      Logger.warn(`[prober] Signed URL unavailable (${err.message}). Staging file to probe...`)
+      try {
+        const fs = require('fs-extra')
+        const Path = require('path')
+        const os = require('os')
+        const gcsProvider = StorageManager.getProvider(filepath)
+        const tmpDir = global.MetadataPath ? Path.join(global.MetadataPath, 'tmp') : os.tmpdir()
+        await fs.ensureDir(tmpDir)
+        tempProbePath = Path.join(tmpDir, `probe-${Date.now()}-${Path.basename(filepath)}`)
+        await gcsProvider.getFile(filepath).download({ destination: tempProbePath })
+        probePath = tempProbePath
+      } catch (dlErr) {
+        Logger.error(`[prober] Failed to stage file "${filepath}" for probing: ${dlErr.message}`)
+      }
+    }
+  }
+
+  try {
+    return await ffprobe(probePath)
+  } catch (err) {
     return {
       error: err
     }
-  })
+  } finally {
+    if (tempProbePath) {
+      const fs = require('fs-extra')
+      await fs.remove(tempProbePath).catch(() => {})
+    }
+  }
 }
 module.exports.rawProbe = rawProbe
+

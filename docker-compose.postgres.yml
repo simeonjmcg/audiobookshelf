@@ -1,0 +1,57 @@
+services:
+  # ==========================================
+  # PostgreSQL Database
+  # ==========================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: audiobookshelf-postgres
+    environment:
+      POSTGRES_USER: abs
+      POSTGRES_PASSWORD: abs_password
+      POSTGRES_DB: audiobookshelf
+    ports:
+      # Exposed as 5433 to avoid conflict with existing postgres instances on 5432
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U abs -d audiobookshelf"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ==========================================
+  # Audiobookshelf Server
+  # ==========================================
+  audiobookshelf:
+    # Build locally from the current workspace including PR #5098 changes
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: audiobookshelf-app
+    environment:
+      - DB_DIALECT=postgres
+      - DATABASE_URL=postgres://abs:abs_password@postgres:5432/audiobookshelf
+      # Audiobookshelf listens on 80 inside the container by default
+      - PORT=80
+      - GCS_BUCKET_NAME=smcgraw-abs-lib
+      - GOOGLE_APPLICATION_CREDENTIALS=/config/gcp-key.json
+      - GOOGLE_CLOUD_PROJECT=smcgraw-audiobookshelf
+      - GCS_PROJECT_ID=smcgraw-audiobookshelf
+    ports:
+      - "13378:80"
+    volumes:
+      - ./config:/config
+      - ./metadata:/metadata
+      - ./audiobooks:/audiobooks
+      - ./podcasts:/podcasts
+      - ./gcp-key.json:/config/gcp-key.json:ro
+      - ~/.config/gcloud:/root/.config/gcloud:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

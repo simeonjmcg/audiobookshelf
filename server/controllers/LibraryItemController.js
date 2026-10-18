@@ -412,16 +412,18 @@ class LibraryItemController {
 
     if (raw) {
       const coverPath = await Database.libraryItemModel.getCoverPath(libraryItemId)
-      if (!coverPath || !(await fs.pathExists(coverPath))) {
+      const CoverManager = require('../managers/CoverManager')
+      const localCoverPath = await CoverManager.getLocalCoverPath(libraryItemId, coverPath)
+      if (!localCoverPath) {
         return res.sendStatus(404)
       }
       // any value
       if (global.XAccel) {
-        const encodedURI = encodeUriPath(global.XAccel + coverPath)
+        const encodedURI = encodeUriPath(global.XAccel + localCoverPath)
         Logger.debug(`Use X-Accel to serve static file ${encodedURI}`)
         return res.status(204).header({ 'X-Accel-Redirect': encodedURI }).send()
       }
-      return res.sendFile(coverPath)
+      return res.sendFile(localCoverPath)
     }
 
     const options = {
@@ -1000,6 +1002,59 @@ class LibraryItemController {
     if (audioMimeType) {
       res.setHeader('Content-Type', audioMimeType)
     }
+
+    const StorageManager = require('../storage/StorageManager')
+    if (StorageManager.isGcsPath(libraryFile.metadata.path)) {
+      try {
+        const signedUrl = await StorageManager.getSignedUrl(libraryFile.metadata.path, {
+          contentType: audioMimeType
+        })
+        if (signedUrl) {
+          Logger.debug(`[LibraryItemController] Redirecting library file to GCS signed URL`)
+          return res.redirect(signedUrl)
+        }
+      } catch (err) {
+        Logger.warn(`[LibraryItemController] Signed URL unavailable for "${libraryFile.metadata.path}" (${err.message}), streaming directly...`)
+      }
+
+      try {
+        const gcsProvider = StorageManager.getProvider(libraryFile.metadata.path)
+        const file = gcsProvider.getFile(libraryFile.metadata.path)
+        const [metadata] = await file.getMetadata()
+        const fileSize = Number(metadata.size)
+
+        const range = req.headers.range
+        if (range) {
+          const parts = range.replace(/bytes=/, '').split('-')
+          const start = parseInt(parts[0], 10)
+          const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1
+          const chunksize = end - start + 1
+
+          res.writeHead(206, {
+            'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+            'Accept-Ranges': 'bytes',
+            'Content-Length': chunksize,
+            'Content-Type': audioMimeType || 'application/octet-stream'
+          })
+          const stream = file.createReadStream({ start, end })
+          req.on('close', () => stream.destroy())
+          return stream.pipe(res)
+        } else {
+          res.writeHead(200, {
+            'Content-Length': fileSize,
+            'Accept-Ranges': 'bytes',
+            'Content-Type': audioMimeType || 'application/octet-stream'
+          })
+          const stream = file.createReadStream()
+          req.on('close', () => stream.destroy())
+          return stream.pipe(res)
+        }
+      } catch (streamErr) {
+        Logger.error(`[LibraryItemController] Failed to stream GCS file "${libraryFile.metadata.path}": ${streamErr.message}`)
+        return res.sendStatus(500)
+      }
+    }
+
     res.sendFile(libraryFile.metadata.path)
   }
 
@@ -1014,7 +1069,8 @@ class LibraryItemController {
 
     Logger.info(`[LibraryItemController] User "${req.user.username}" requested file delete at "${libraryFile.metadata.path}"`)
 
-    await fs.remove(libraryFile.metadata.path).catch((error) => {
+    const StorageManager = require('../storage/StorageManager')
+    await StorageManager.delete(libraryFile.metadata.path).catch((error) => {
       Logger.error(`[LibraryItemController] Failed to delete library file at "${libraryFile.metadata.path}"`, error)
     })
 
@@ -1100,6 +1156,40 @@ class LibraryItemController {
       res.setHeader('Content-Type', audioMimeType)
     }
 
+    const StorageManager = require('../storage/StorageManager')
+    if (StorageManager.isGcsPath(libraryFile.metadata.path)) {
+      const filename = libraryFile.metadata.filename || Path.basename(libraryFile.metadata.path)
+      try {
+        const signedUrl = await StorageManager.getSignedUrl(libraryFile.metadata.path, {
+          contentType: audioMimeType,
+          responseDisposition: `attachment; filename="${filename}"`
+        })
+        if (signedUrl) {
+          Logger.debug(`[LibraryItemController] Redirecting download to GCS signed URL`)
+          return res.redirect(signedUrl)
+        }
+      } catch (err) {
+        Logger.warn(`[LibraryItemController] Signed URL unavailable for download "${libraryFile.metadata.path}" (${err.message}), piping download...`)
+      }
+
+      try {
+        const gcsProvider = StorageManager.getProvider(libraryFile.metadata.path)
+        const file = gcsProvider.getFile(libraryFile.metadata.path)
+        const [metadata] = await file.getMetadata()
+        res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`)
+        if (audioMimeType) {
+          res.setHeader('Content-Type', audioMimeType)
+        }
+        res.setHeader('Content-Length', metadata.size)
+        const stream = file.createReadStream()
+        req.on('close', () => stream.destroy())
+        return stream.pipe(res)
+      } catch (dlErr) {
+        Logger.error(`[LibraryItemController] Failed to pipe GCS download "${libraryFile.metadata.path}": ${dlErr.message}`)
+        return res.sendStatus(500)
+      }
+    }
+
     try {
       await new Promise((resolve, reject) => res.download(libraryFile.metadata.path, libraryFile.metadata.filename, (error) => (error ? reject(error) : resolve())))
       Logger.info(`[LibraryItemController] Downloaded file "${libraryFile.metadata.path}"`)
@@ -1142,6 +1232,32 @@ class LibraryItemController {
       const encodedURI = encodeUriPath(global.XAccel + ebookFilePath)
       Logger.debug(`Use X-Accel to serve static file ${encodedURI}`)
       return res.status(204).header({ 'X-Accel-Redirect': encodedURI }).send()
+    }
+
+    const StorageManager = require('../storage/StorageManager')
+    if (StorageManager.isGcsPath(ebookFilePath)) {
+      try {
+        const signedUrl = await StorageManager.getSignedUrl(ebookFilePath)
+        if (signedUrl) {
+          Logger.debug(`[LibraryItemController] Redirecting ebook file to GCS signed URL`)
+          return res.redirect(signedUrl)
+        }
+      } catch (err) {
+        Logger.warn(`[LibraryItemController] Signed URL unavailable for ebook "${ebookFilePath}" (${err.message}), streaming directly...`)
+      }
+
+      try {
+        const gcsProvider = StorageManager.getProvider(ebookFilePath)
+        const file = gcsProvider.getFile(ebookFilePath)
+        const [metadata] = await file.getMetadata()
+        res.setHeader('Content-Length', metadata.size)
+        const stream = file.createReadStream()
+        req.on('close', () => stream.destroy())
+        return stream.pipe(res)
+      } catch (streamErr) {
+        Logger.error(`[LibraryItemController] Failed to stream GCS ebook "${ebookFilePath}": ${streamErr.message}`)
+        return res.sendStatus(500)
+      }
     }
 
     try {

@@ -32,10 +32,22 @@ async function writeConcatFile(tracks, outputPath, startTime = 0) {
   }
 
   var tracksToInclude = tracks.filter((t) => t.index >= trackToStartWithIndex)
-  var trackPaths = tracksToInclude.map((t) => {
-    var line = "file '" + escapeSingleQuotes(t.metadata.path) + "'\n" + `duration ${t.duration}`
-    return line
-  })
+  const StorageManager = require('../storage/StorageManager')
+  var trackPaths = await Promise.all(
+    tracksToInclude.map(async (t) => {
+      let trackPath = t.metadata.path
+      if (StorageManager.isGcsPath(trackPath)) {
+        try {
+          const signedUrl = await StorageManager.getSignedUrl(trackPath, { expiryHours: 6 })
+          if (signedUrl) trackPath = signedUrl
+        } catch (err) {
+          Logger.error(`[ffmpegHelpers] Failed to generate signed URL for track "${trackPath}": ${err.message}`)
+        }
+      }
+      var line = "file '" + escapeSingleQuotes(trackPath) + "'\n" + `duration ${t.duration}`
+      return line
+    })
+  )
   var inputstr = trackPaths.join('\n\n')
 
   try {
@@ -49,28 +61,101 @@ async function writeConcatFile(tracks, outputPath, startTime = 0) {
 module.exports.writeConcatFile = writeConcatFile
 
 async function extractCoverArt(filepath, outputpath) {
-  var dirname = Path.dirname(outputpath)
-  await fs.ensureDir(dirname)
+  const StorageManager = require('../storage/StorageManager')
+  const isOutputGcs = StorageManager.isGcsPath(outputpath)
+  let localOutputPath = outputpath
+  let tempLocalCoverPath = null
 
-  return new Promise((resolve) => {
-    /** @type {import('../libs/fluentFfmpeg/index').FfmpegCommand} */
-    var ffmpeg = Ffmpeg(filepath)
-    ffmpeg.addOption(['-map 0:v:0', '-frames:v 1'])
-    ffmpeg.output(outputpath)
+  if (isOutputGcs) {
+    const os = require('os')
+    const tmpDir = global.MetadataPath ? Path.join(global.MetadataPath, 'tmp') : os.tmpdir()
+    await fs.ensureDir(tmpDir)
+    tempLocalCoverPath = Path.join(tmpDir, `cover-dest-${Date.now()}-${Path.basename(outputpath)}`)
+    localOutputPath = tempLocalCoverPath
+  } else {
+    var dirname = Path.dirname(outputpath)
+    await fs.ensureDir(dirname)
+  }
 
-    ffmpeg.on('start', (cmd) => {
-      Logger.debug(`[FfmpegHelpers] Extract Cover Cmd: ${cmd}`)
+  const runFfmpeg = (sourcePath) => {
+    return new Promise((resolve) => {
+      /** @type {import('../libs/fluentFfmpeg/index').FfmpegCommand} */
+      var ffmpeg = Ffmpeg(sourcePath)
+      ffmpeg.inputOption('-protocol_whitelist file,crypto,data,http,https,tcp,tls,httpproxy')
+      ffmpeg.addOption(['-an', '-sn', '-dn', '-map 0:v:0', '-c:v copy', '-update 1', '-y'])
+      ffmpeg.output(localOutputPath)
+
+      ffmpeg.on('start', (cmd) => {
+        Logger.debug(`[FfmpegHelpers] Extract Cover Cmd: ${cmd}`)
+      })
+      ffmpeg.on('error', async (err) => {
+        // If image was written despite exit error, treat as success
+        if ((await fs.pathExists(localOutputPath)) && (await fs.stat(localOutputPath).then((s) => s.size > 0).catch(() => false))) {
+          Logger.info(`[FfmpegHelpers] Cover Art Extracted Successfully: "${outputpath}"`)
+          return resolve(true)
+        }
+        await fs.remove(localOutputPath).catch(() => {})
+        Logger.warn(`[FfmpegHelpers] Extract Cover attempt failed (${err.message})`)
+        resolve(false)
+      })
+      ffmpeg.on('end', () => {
+        Logger.info(`[FfmpegHelpers] Cover Art Extracted Successfully: "${outputpath}"`)
+        resolve(true)
+      })
+      ffmpeg.run()
     })
-    ffmpeg.on('error', (err, stdout, stderr) => {
-      Logger.error(`[FfmpegHelpers] Extract Cover Error ${err}`)
-      resolve(false)
-    })
-    ffmpeg.on('end', () => {
-      Logger.debug(`[FfmpegHelpers] Cover Art Extracted Successfully`)
-      resolve(outputpath)
-    })
-    ffmpeg.run()
-  })
+  }
+
+  let success = false
+  if (StorageManager.isGcsPath(filepath)) {
+    try {
+      const signedUrl = await StorageManager.getSignedUrl(filepath, { expiryHours: 1 })
+      if (signedUrl) {
+        success = await runFfmpeg(signedUrl)
+      }
+    } catch (err) {
+      Logger.warn(`[ffmpegHelpers] Signed URL cover extraction error (${err.message})`)
+    }
+
+    // Fallback: stage file locally to extract cover
+    if (!success) {
+      let tempFilePath = null
+      try {
+        Logger.info(`[ffmpegHelpers] Staging file locally for cover extraction: "${filepath}"`)
+        const os = require('os')
+        const gcsProvider = StorageManager.getProvider(filepath)
+        const tmpDir = global.MetadataPath ? Path.join(global.MetadataPath, 'tmp') : os.tmpdir()
+        await fs.ensureDir(tmpDir)
+        tempFilePath = Path.join(tmpDir, `cover-src-${Date.now()}-${Path.basename(filepath)}`)
+        await gcsProvider.getFile(filepath).download({ destination: tempFilePath })
+        success = await runFfmpeg(tempFilePath)
+      } catch (dlErr) {
+        Logger.error(`[ffmpegHelpers] Failed to stage file for cover extraction: ${dlErr.message}`)
+      } finally {
+        if (tempFilePath) {
+          await fs.remove(tempFilePath).catch(() => {})
+        }
+      }
+    }
+  } else {
+    success = await runFfmpeg(filepath)
+  }
+
+  if (success && isOutputGcs) {
+    try {
+      const gcsProvider = StorageManager.getProvider(outputpath)
+      const parsed = gcsProvider.parsePath(outputpath)
+      await gcsProvider.getBucket(parsed.bucketName).upload(localOutputPath, { destination: parsed.key })
+      await fs.remove(localOutputPath).catch(() => {})
+      return outputpath
+    } catch (uploadErr) {
+      Logger.error(`[FfmpegHelpers] Failed to upload extracted cover to GCS "${outputpath}": ${uploadErr.message}`)
+      await fs.remove(localOutputPath).catch(() => {})
+      return false
+    }
+  }
+
+  return success ? outputpath : false
 }
 module.exports.extractCoverArt = extractCoverArt
 
@@ -462,7 +547,7 @@ async function mergeAudioFiles(audioTracks, duration, itemCachePath, outputFileP
     if ((await writeConcatFile(audioTracks, concatFilePath)) == null) {
       throw new Error('Failed to write concat file')
     }
-    ffmpeg.input(concatFilePath).inputOptions(['-safe 0', '-f concat'])
+    ffmpeg.input(concatFilePath).inputOptions(['-safe 0', '-f concat', '-protocol_whitelist file,crypto,data,http,https,tcp,tls'])
   } else {
     ffmpeg.input(audioTracks[0].metadata.path).inputOptions(firstTrackIsM4b ? ['-f mp4'] : [])
   }

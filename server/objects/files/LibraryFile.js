@@ -1,7 +1,8 @@
 const Path = require('path')
-const { getFileTimestampsWithIno, filePathToPOSIX } = require('../../utils/fileUtils')
+const { filePathToPOSIX } = require('../../utils/fileUtils')
 const globals = require('../../utils/globals')
 const FileMetadata = require('../metadata/FileMetadata')
+const StorageManager = require('../../storage/StorageManager')
 
 class LibraryFile {
   constructor(file) {
@@ -61,7 +62,7 @@ class LibraryFile {
   }
 
   async setDataFromPath(path, relPath) {
-    var fileTsData = await getFileTimestampsWithIno(path)
+    var fileTsData = await StorageManager.getFileTimestampsWithIno(path)
     var fileMetadata = new FileMetadata()
     fileMetadata.setData(fileTsData)
     fileMetadata.filename = Path.basename(relPath)

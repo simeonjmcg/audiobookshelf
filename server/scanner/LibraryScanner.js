@@ -15,6 +15,7 @@ const LibraryScan = require('./LibraryScan')
 const LibraryItemScanData = require('./LibraryItemScanData')
 const Task = require('../objects/Task')
 const { isPostgres, jsonArrayExpand } = require('../utils/sqlDialectHelpers')
+const StorageManager = require('../storage/StorageManager')
 
 class LibraryScanner {
   constructor() {
@@ -182,7 +183,7 @@ class LibraryScanner {
 
       if (!libraryItemData) {
         // Podcast folder can have no episodes and still be valid
-        if (libraryScan.libraryMediaType === 'podcast' && (await fs.pathExists(existingLibraryItem.path))) {
+        if (libraryScan.libraryMediaType === 'podcast' && (await StorageManager.pathExists(existingLibraryItem.path))) {
           libraryScan.addLog(LogLevel.INFO, `Library item "${existingLibraryItem.relPath}" folder exists but has no episodes`)
         } else {
           libraryScan.addLog(LogLevel.WARN, `Library Item "${existingLibraryItem.path}" (inode: ${existingLibraryItem.ino}) is missing`)
@@ -305,13 +306,13 @@ class LibraryScanner {
   async scanFolder(library, folder) {
     const folderPath = fileUtils.filePathToPOSIX(folder.path)
 
-    const pathExists = await fs.pathExists(folderPath)
+    const pathExists = await StorageManager.pathExists(folderPath)
     if (!pathExists) {
       Logger.error(`[scandir] Invalid folder path does not exist "${folderPath}"`)
       return []
     }
 
-    const fileItems = await fileUtils.recurseFiles(folderPath)
+    const fileItems = await StorageManager.recurseFiles(folderPath)
     const libraryItemGrouping = scanUtils.groupFileItemsIntoLibraryItemDirs(library.mediaType, fileItems, library.settings.audiobooksOnly)
 
     if (!Object.keys(libraryItemGrouping).length) {
@@ -330,7 +331,7 @@ class LibraryScanner {
           mediaMetadata: {
             title: Path.basename(libraryItemPath, Path.extname(libraryItemPath))
           },
-          path: Path.posix.join(folderPath, libraryItemPath),
+          path: StorageManager.join(folderPath, libraryItemPath),
           relPath: libraryItemPath
         }
         fileObjs = await scanUtils.buildLibraryFile(folderPath, [libraryItemPath])
@@ -340,7 +341,7 @@ class LibraryScanner {
         fileObjs = await scanUtils.buildLibraryFile(libraryItemData.path, libraryItemGrouping[libraryItemPath])
       }
 
-      const libraryItemFolderStats = await fileUtils.getFileTimestampsWithIno(libraryItemData.path)
+      const libraryItemFolderStats = await StorageManager.getFileTimestampsWithIno(libraryItemData.path)
 
       if (!libraryItemFolderStats.ino) {
         Logger.warn(`[LibraryScanner] Library item folder "${libraryItemData.path}" has no inode value`)
@@ -511,7 +512,7 @@ class LibraryScanner {
       const firstNest = itemDirNestedFiles[0].split('/').shift()
       const altDir = `${itemDir}/${firstNest}`
 
-      const fullPath = Path.posix.join(fileUtils.filePathToPOSIX(folder.path), itemDir)
+      const fullPath = StorageManager.join(fileUtils.filePathToPOSIX(folder.path), itemDir)
       const childLibraryItem = await Database.libraryItemModel.findOne({
         attributes: ['id', 'path'],
         where: {
@@ -524,7 +525,7 @@ class LibraryScanner {
         continue
       }
 
-      const altFullPath = Path.posix.join(fileUtils.filePathToPOSIX(folder.path), altDir)
+      const altFullPath = StorageManager.join(fileUtils.filePathToPOSIX(folder.path), altDir)
       const altChildLibraryItem = await Database.libraryItemModel.findOne({
         attributes: ['id', 'path'],
         where: {
@@ -545,14 +546,14 @@ class LibraryScanner {
     // Second pass: Check for new/updated/removed items
     const itemGroupingResults = {}
     for (const itemDir in fileUpdateGroup) {
-      const fullPath = Path.posix.join(fileUtils.filePathToPOSIX(folder.path), itemDir)
+      const fullPath = StorageManager.join(fileUtils.filePathToPOSIX(folder.path), itemDir)
 
       const itemDirParts = itemDir.split('/').slice(0, -1)
 
       const potentialChildDirs = [fullPath]
       for (let i = 0; i < itemDirParts.length; i++) {
         potentialChildDirs.push(
-          Path.posix.join(
+          StorageManager.join(
             fileUtils.filePathToPOSIX(folder.path),
             itemDir
               .split('/')
@@ -585,7 +586,7 @@ class LibraryScanner {
       if (existingLibraryItem) {
         // Is the item exactly - check if was deleted
         if (existingLibraryItem.path === fullPath) {
-          const exists = await fs.pathExists(fullPath)
+          const exists = await StorageManager.pathExists(fullPath)
           if (!exists) {
             Logger.info(`[LibraryScanner] Scanning file update group and library item was deleted "${existingLibraryItem.media.title}" - marking as missing`)
             existingLibraryItem.isMissing = true
@@ -603,7 +604,7 @@ class LibraryScanner {
       } else if (library.settings.audiobooksOnly && !hasAudioFiles(fileUpdateGroup, itemDir)) {
         Logger.debug(`[LibraryScanner] Folder update for relative path "${itemDir}" has no audio files`)
         continue
-      } else if (!(await fs.pathExists(fullPath))) {
+      } else if (!(await StorageManager.pathExists(fullPath))) {
         Logger.info(`[LibraryScanner] File update group "${itemDir}" does not exist - ignoring`)
 
         itemGroupingResults[itemDir] = ScanResult.NOTHING
@@ -656,7 +657,7 @@ function isSingleMediaFile(fileUpdateGroup, itemDir) {
 }
 
 async function findLibraryItemByItemToItemInoMatch(libraryId, fullPath) {
-  const ino = await fileUtils.getIno(fullPath)
+  const ino = await StorageManager.getIno(fullPath)
   if (!ino) return null
   const existingLibraryItem = await Database.libraryItemModel.findOneExpanded({
     libraryId: libraryId,
@@ -669,7 +670,7 @@ async function findLibraryItemByItemToItemInoMatch(libraryId, fullPath) {
 async function findLibraryItemByItemToFileInoMatch(libraryId, fullPath, isSingleMedia) {
   if (!isSingleMedia) return null
   // check if it was moved from another folder by comparing the ino to the library files
-  const ino = await fileUtils.getIno(fullPath)
+  const ino = await StorageManager.getIno(fullPath)
   if (!ino) return null
   const inodeMatchQuery = isPostgres(Database.sequelize)
     ? `(SELECT count(*) FROM ${jsonArrayExpand('libraryFiles', Database.sequelize, { textValues: false })} WHERE json_each.value #>> '{ino}' = :inode)`
@@ -697,7 +698,7 @@ async function findLibraryItemByFileToItemInoMatch(libraryId, fullPath, isSingle
   // check if it was moved from the root folder by comparing the ino to the ino of the scanned files
   let itemFileInos = []
   for (const itemFile of itemFiles) {
-    const ino = await fileUtils.getIno(Path.posix.join(fullPath, itemFile))
+    const ino = await StorageManager.getIno(StorageManager.join(fullPath, itemFile))
     if (ino) itemFileInos.push(ino)
   }
   if (!itemFileInos.length) return null

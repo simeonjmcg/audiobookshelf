@@ -130,7 +130,10 @@ module.exports.groupFileItemsIntoLibraryItemDirs = groupFileItemsIntoLibraryItem
 function buildLibraryFile(libraryItemPath, files) {
   return Promise.all(
     files.map(async (file) => {
-      const filePath = Path.posix.join(libraryItemPath, file)
+      let filePath = Path.posix.join(libraryItemPath, file)
+      if (filePath.startsWith('gcs:/') || filePath.startsWith('gs:/')) {
+        filePath = filePath.replace(/^(gcs|gs):\/+/, 'gcs://')
+      }
       const newLibraryFile = new LibraryFile()
       await newLibraryFile.setDataFromPath(filePath, file)
       return newLibraryFile
@@ -299,6 +302,9 @@ function getPodcastDataFromDir(relPath) {
 function getDataFromMediaDir(libraryMediaType, folderPath, relPath) {
   relPath = filePathToPOSIX(relPath)
   let fullPath = Path.posix.join(folderPath, relPath)
+  if (fullPath.startsWith('gcs:/') || fullPath.startsWith('gs:/')) {
+    fullPath = fullPath.replace(/^(gcs|gs):\/+/, 'gcs://')
+  }
   let mediaMetadata = null
 
   if (libraryMediaType === 'podcast') {

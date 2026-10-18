@@ -5,6 +5,7 @@ const fs = require('../libs/fsExtra')
 const { toNumber } = require('../utils/index')
 const fileUtils = require('../utils/fileUtils')
 const Database = require('../Database')
+const StorageManager = require('../storage/StorageManager')
 
 /**
  * @typedef RequestUserObject
@@ -29,6 +30,20 @@ class FileSystemController {
 
     const relpath = req.query.path
     const level = toNumber(req.query.level, 0)
+
+    // GCS path browsing
+    if (relpath && (relpath.startsWith('gcs:') || relpath.startsWith('gs:'))) {
+      const exists = await StorageManager.pathExists(relpath)
+      if (!exists) {
+        Logger.error(`[FileSystemController] Invalid GCS path in query string "${relpath}"`)
+        return res.status(400).send('Invalid "path" query string')
+      }
+      const directories = await StorageManager.getDirectoriesInPath(relpath, level)
+      return res.json({
+        posix: true,
+        directories
+      })
+    }
 
     // Validate path. Must be absolute
     if (relpath && (!Path.isAbsolute(relpath) || !(await fs.pathExists(relpath)))) {
@@ -69,6 +84,22 @@ class FileSystemController {
     directories = directories.filter((dir) => {
       return !excludedDirs.includes(dir.path)
     })
+
+    // If browsing root, list all accessible GCS buckets using server credentials
+    if (!relpath) {
+      try {
+        const gcsBuckets = await StorageManager.getBuckets()
+        for (const bucket of gcsBuckets) {
+          directories.unshift({
+            path: bucket.uri,
+            dirname: bucket.uri,
+            level: 0
+          })
+        }
+      } catch (err) {
+        Logger.warn(`[FileSystemController] Failed to query GCS buckets: ${err.message}`)
+      }
+    }
 
     res.json({
       posix: !global.isWin,
@@ -113,16 +144,16 @@ class FileSystemController {
       return res.sendStatus(403)
     }
 
-    let filepath = Path.join(libraryFolder.path, directory)
+    let filepath = StorageManager.join(libraryFolder.path, directory)
     filepath = fileUtils.filePathToPOSIX(filepath)
 
     // Ensure filepath is inside library folder (prevents directory traversal)
-    if (!fileUtils.isSameOrSubPath(libraryFolder.path, filepath)) {
+    if (!StorageManager.isGcsPath(libraryFolder.path) && !fileUtils.isSameOrSubPath(libraryFolder.path, filepath)) {
       Logger.error(`[FileSystemController] Filepath is not inside library folder: ${filepath}`)
       return res.sendStatus(400)
     }
 
-    if (await fs.pathExists(filepath)) {
+    if (await StorageManager.pathExists(filepath)) {
       return res.json({
         exists: true
       })
@@ -135,9 +166,9 @@ class FileSystemController {
       // Can only be 2 levels deep
       const possiblePaths = []
       const subdir = Path.dirname(directory)
-      possiblePaths.push(fileUtils.filePathToPOSIX(Path.join(folderPath, subdir)))
+      possiblePaths.push(StorageManager.join(folderPath, subdir))
       if (subdir.includes('/')) {
-        possiblePaths.push(fileUtils.filePathToPOSIX(Path.join(folderPath, Path.dirname(subdir))))
+        possiblePaths.push(StorageManager.join(folderPath, Path.dirname(subdir)))
       }
 
       const libraryItem = await Database.libraryItemModel.findOne({

@@ -27,6 +27,8 @@ export const state = () => ({
   isCasting: false, // Actively casting
   isChromecastInitialized: false, // Script loadeds
   showBatchQuickMatchModal: false,
+  isGlobalUploading: false,
+  globalUploadProgress: 0,
   dateFormats: [
     {
       text: 'MM/DD/YYYY',
@@ -159,6 +161,12 @@ export const mutations = {
   },
   setShowConfirmPrompt(state, val) {
     state.showConfirmPrompt = val
+  },
+  setIsGlobalUploading(state, val) {
+    state.isGlobalUploading = val
+  },
+  setGlobalUploadProgress(state, val) {
+    state.globalUploadProgress = val
   },
   setConfirmPrompt(state, options) {
     state.confirmPromptOptions = options

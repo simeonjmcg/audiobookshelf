@@ -326,6 +326,59 @@ class SessionController {
     if (audioMimeType) {
       res.setHeader('Content-Type', audioMimeType)
     }
+
+    const StorageManager = require('../storage/StorageManager')
+    if (StorageManager.isGcsPath(audioTrack.metadata.path)) {
+      try {
+        const signedUrl = await StorageManager.getSignedUrl(audioTrack.metadata.path, {
+          contentType: audioMimeType
+        })
+        if (signedUrl) {
+          Logger.debug(`[SessionController] Redirecting track ${audioTrack.index} to GCS signed URL`)
+          return res.redirect(signedUrl)
+        }
+      } catch (err) {
+        Logger.warn(`[SessionController] Signed URL unavailable for track "${audioTrack.metadata.path}" (${err.message}), streaming directly...`)
+      }
+
+      try {
+        const gcsProvider = StorageManager.getProvider(audioTrack.metadata.path)
+        const file = gcsProvider.getFile(audioTrack.metadata.path)
+        const [metadata] = await file.getMetadata()
+        const fileSize = Number(metadata.size)
+
+        const range = req.headers.range
+        if (range) {
+          const parts = range.replace(/bytes=/, '').split('-')
+          const start = parseInt(parts[0], 10)
+          const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1
+          const chunksize = end - start + 1
+
+          res.writeHead(206, {
+            'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+            'Accept-Ranges': 'bytes',
+            'Content-Length': chunksize,
+            'Content-Type': audioMimeType || 'application/octet-stream'
+          })
+          const stream = file.createReadStream({ start, end })
+          req.on('close', () => stream.destroy())
+          return stream.pipe(res)
+        } else {
+          res.writeHead(200, {
+            'Content-Length': fileSize,
+            'Accept-Ranges': 'bytes',
+            'Content-Type': audioMimeType || 'application/octet-stream'
+          })
+          const stream = file.createReadStream()
+          req.on('close', () => stream.destroy())
+          return stream.pipe(res)
+        }
+      } catch (streamErr) {
+        Logger.error(`[SessionController] Failed to stream GCS file "${audioTrack.metadata.path}": ${streamErr.message}`)
+        return res.sendStatus(500)
+      }
+    }
+
     res.sendFile(audioTrack.metadata.path)
   }
 

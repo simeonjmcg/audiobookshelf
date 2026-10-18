@@ -254,6 +254,7 @@ class Stream extends EventEmitter {
     this.ffmpeg.inputOption('-seek_timestamp 1')
     this.ffmpeg.inputFormat('concat')
     this.ffmpeg.inputOption('-safe 0')
+    this.ffmpeg.inputOption('-protocol_whitelist file,crypto,data,http,https,tcp,tls')
 
     if (adjustedStartTime > 0) {
       const shiftedStartTime = adjustedStartTime - trackStartTime

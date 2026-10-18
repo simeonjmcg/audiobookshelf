@@ -159,13 +159,19 @@ class ShareController {
       return res.status(404).send('Cover image not found')
     }
 
+    const CoverManager = require('../managers/CoverManager')
+    const localCoverPath = await CoverManager.getLocalCoverPath(playbackSession.libraryItemId, coverPath)
+    if (!localCoverPath) {
+      return res.status(404).send('Cover image not found')
+    }
+
     if (global.XAccel) {
-      const encodedURI = encodeUriPath(global.XAccel + coverPath)
+      const encodedURI = encodeUriPath(global.XAccel + localCoverPath)
       Logger.debug(`Use X-Accel to serve static file ${encodedURI}`)
       return res.status(204).header({ 'X-Accel-Redirect': encodedURI }).send()
     }
 
-    res.sendFile(coverPath)
+    res.sendFile(localCoverPath)
   }
 
   /**

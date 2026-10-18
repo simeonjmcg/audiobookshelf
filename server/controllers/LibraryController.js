@@ -25,6 +25,7 @@ const libraryItemsPodcastFilters = require('../utils/queries/libraryItemsPodcast
 const authorFilters = require('../utils/queries/authorFilters')
 const zipHelpers = require('../utils/zipHelpers')
 const { isPostgres, noCaseSortExpression, jsonArrayExpand } = require('../utils/sqlDialectHelpers')
+const StorageManager = require('../storage/StorageManager')
 
 /**
  * @typedef RequestUserObject
@@ -133,13 +134,17 @@ class LibraryController {
     //   returns 400 if a folder fails to access
     newLibraryPayload.libraryFolders = req.body.folders.map((f) => {
       const fpath = f.fullPath || f.path
-      f.path = fileUtils.filePathToPOSIX(Path.resolve(fpath))
+      if (typeof fpath === 'string' && (fpath.startsWith('gcs://') || fpath.startsWith('gs://'))) {
+        f.path = fpath.replace(/^gs:\/\//, 'gcs://').replace(/\/+$/, '')
+      } else {
+        f.path = fileUtils.filePathToPOSIX(Path.resolve(fpath))
+      }
       return f
     })
     for (const folder of newLibraryPayload.libraryFolders) {
       try {
         // Create folder if it doesn't exist
-        await fs.ensureDir(folder.path)
+        await StorageManager.ensureDir(folder.path)
       } catch (error) {
         Logger.error(`[LibraryController] Failed to ensure folder dir "${folder.path}"`, error)
         return res.status(400).send(`Invalid request. Invalid folder directory "${folder.path}"`)
@@ -383,15 +388,19 @@ class LibraryController {
       req.body.folders = req.body.folders.map((f) => {
         if (!f.id) {
           const path = f.fullPath || f.path
-          f.path = fileUtils.filePathToPOSIX(Path.resolve(path))
+          if (typeof path === 'string' && (path.startsWith('gcs://') || path.startsWith('gs://'))) {
+            f.path = path.replace(/^gs:\/\//, 'gcs://').replace(/\/+$/, '')
+          } else {
+            f.path = fileUtils.filePathToPOSIX(Path.resolve(path))
+          }
           newFolderPaths.push(f.path)
         }
         return f
       })
       for (const path of newFolderPaths) {
-        const pathExists = await fs.pathExists(path)
+        const pathExists = await StorageManager.pathExists(path)
         if (!pathExists) {
-          const success = await fs
+          const success = await StorageManager
             .ensureDir(path)
             .then(() => true)
             .catch((error) => {
