@@ -16,6 +16,8 @@ const LibraryItemScanData = require('./LibraryItemScanData')
 const Task = require('../objects/Task')
 const { isPostgres, jsonArrayExpand } = require('../utils/sqlDialectHelpers')
 const StorageManager = require('../storage/StorageManager')
+const prober = require('../utils/prober')
+const { pLimit } = require('../utils/asyncUtils')
 
 class LibraryScanner {
   constructor() {
@@ -168,6 +170,33 @@ class LibraryScanner {
 
     if (this.shouldCancelScan(libraryScan)) return true
 
+    // Parallel pre-probe modified/new audio files before sequential database operations
+    const audioFilesToProbe = this.collectAudioFilesToPreProbe(existingLibraryItems, libraryItemDataFound, forceRescan)
+    if (audioFilesToProbe.length) {
+      const probeConcurrency = parseInt(process.env.PROBE_CONCURRENCY || '8', 10)
+      libraryScan.addLog(LogLevel.INFO, `Pre-probing ${audioFilesToProbe.length} audio files in parallel (concurrency: ${probeConcurrency})...`)
+      const probeLimit = pLimit(probeConcurrency)
+      let probed = 0
+      await Promise.all(
+        audioFilesToProbe.map((filePath) =>
+          probeLimit(async () => {
+            if (this.shouldCancelScan(libraryScan)) return
+            try {
+              await prober.probe(filePath)
+            } catch (err) {
+              Logger.warn(`[LibraryScanner] Failed to pre-probe "${filePath}": ${err.message}`)
+            }
+            probed++
+            if (probed % 25 === 0 || probed === audioFilesToProbe.length) {
+              libraryScan.addLog(LogLevel.DEBUG, `Pre-probed ${probed}/${audioFilesToProbe.length} audio files`)
+            }
+          })
+        )
+      )
+    }
+
+    if (this.shouldCancelScan(libraryScan)) return true
+
     const libraryItemIdsMissing = []
     let libraryItemsUpdated = []
     for (const existingLibraryItem of existingLibraryItems) {
@@ -289,6 +318,64 @@ class LibraryScanner {
     return false
   }
 
+  /**
+   * Collect audio file paths that need probing based on scan data and existing records
+   * @param {import('../models/LibraryItem')[]} existingLibraryItems
+   * @param {LibraryItemScanData[]} libraryItemDataFound
+   * @param {boolean} forceRescan
+   * @returns {string[]}
+   */
+  collectAudioFilesToPreProbe(existingLibraryItems, libraryItemDataFound, forceRescan) {
+    const audioFilesToProbe = new Set()
+
+    for (const libraryItemData of libraryItemDataFound) {
+      const matchingExisting = existingLibraryItems.find(
+        (eli) => eli.path === libraryItemData.path || ItemToItemInoMatch(libraryItemData, eli) || ItemToFileInoMatch(libraryItemData, eli) || ItemToFileInoMatch(eli, libraryItemData)
+      )
+
+      if (!matchingExisting) {
+        // New item: all audio files will be scanned
+        for (const file of libraryItemData.audioLibraryFiles) {
+          if (file.metadata?.path) {
+            audioFilesToProbe.add(file.metadata.path)
+          }
+        }
+      } else if (forceRescan) {
+        // Forced rescan: probe all files and invalidate any stale cache
+        for (const file of libraryItemData.audioLibraryFiles) {
+          if (file.metadata?.path) {
+            prober.clearProbeCache(file.metadata.path)
+            audioFilesToProbe.add(file.metadata.path)
+          }
+        }
+      } else {
+        const itemMtimeChanged = matchingExisting.mtime?.valueOf() !== libraryItemData.mtimeMs
+        const itemInoChanged = matchingExisting.ino !== libraryItemData.ino
+
+        const existingFiles = matchingExisting.libraryFiles || []
+        for (const file of libraryItemData.audioLibraryFiles) {
+          const matchingFile = existingFiles.find(
+            (ef) => ef.metadata?.path === file.metadata?.path || (ef.ino && ef.ino === file.ino)
+          )
+
+          if (!matchingFile) {
+            // New audio file added to existing item
+            audioFilesToProbe.add(file.metadata.path)
+          } else {
+            const fileMtimeChanged = matchingFile.metadata?.mtimeMs !== file.metadata?.mtimeMs
+            const fileInoChanged = matchingFile.ino !== file.ino
+            if (itemMtimeChanged || itemInoChanged || fileMtimeChanged || fileInoChanged) {
+              prober.clearProbeCache(file.metadata.path)
+              audioFilesToProbe.add(file.metadata.path)
+            }
+          }
+        }
+      }
+    }
+
+    return Array.from(audioFilesToProbe)
+  }
+
   shouldCancelScan(libraryScan) {
     if (this.cancelLibraryScan[libraryScan.libraryId]) {
       libraryScan.addLog(LogLevel.INFO, `Scan canceled. ${libraryScan.resultStats}`)
@@ -320,51 +407,57 @@ class LibraryScanner {
       return []
     }
 
-    const items = []
-    for (const libraryItemPath in libraryItemGrouping) {
-      let isFile = false // item is not in a folder
-      let libraryItemData = null
-      let fileObjs = []
-      if (libraryItemPath === libraryItemGrouping[libraryItemPath]) {
-        // Media file in root only get title
-        libraryItemData = {
-          mediaMetadata: {
-            title: Path.basename(libraryItemPath, Path.extname(libraryItemPath))
-          },
-          path: StorageManager.join(folderPath, libraryItemPath),
-          relPath: libraryItemPath
-        }
-        fileObjs = await scanUtils.buildLibraryFile(folderPath, [libraryItemPath])
-        isFile = true
-      } else {
-        libraryItemData = scanUtils.getDataFromMediaDir(library.mediaType, folderPath, libraryItemPath)
-        fileObjs = await scanUtils.buildLibraryFile(libraryItemData.path, libraryItemGrouping[libraryItemPath])
-      }
+    const entries = Object.entries(libraryItemGrouping)
+    const scanLimit = pLimit(16)
+    const items = (
+      await Promise.all(
+        entries.map(([libraryItemPath, groupFiles]) =>
+          scanLimit(async () => {
+            let isFile = false // item is not in a folder
+            let libraryItemData = null
+            let fileObjs = []
+            if (libraryItemPath === groupFiles) {
+              // Media file in root only get title
+              libraryItemData = {
+                mediaMetadata: {
+                  title: Path.basename(libraryItemPath, Path.extname(libraryItemPath))
+                },
+                path: StorageManager.join(folderPath, libraryItemPath),
+                relPath: libraryItemPath
+              }
+              fileObjs = await scanUtils.buildLibraryFile(folderPath, [libraryItemPath])
+              isFile = true
+            } else {
+              libraryItemData = scanUtils.getDataFromMediaDir(library.mediaType, folderPath, libraryItemPath)
+              fileObjs = await scanUtils.buildLibraryFile(libraryItemData.path, groupFiles)
+            }
 
-      const libraryItemFolderStats = await StorageManager.getFileTimestampsWithIno(libraryItemData.path)
+            const libraryItemFolderStats = await StorageManager.getFileTimestampsWithIno(libraryItemData.path)
 
-      if (!libraryItemFolderStats.ino) {
-        Logger.warn(`[LibraryScanner] Library item folder "${libraryItemData.path}" has no inode value`)
-        continue
-      }
+            if (!libraryItemFolderStats.ino) {
+              Logger.warn(`[LibraryScanner] Library item folder "${libraryItemData.path}" has no inode value`)
+              return null
+            }
 
-      items.push(
-        new LibraryItemScanData({
-          libraryFolderId: folder.id,
-          libraryId: folder.libraryId,
-          mediaType: library.mediaType,
-          ino: libraryItemFolderStats.ino,
-          mtimeMs: libraryItemFolderStats.mtimeMs || 0,
-          ctimeMs: libraryItemFolderStats.ctimeMs || 0,
-          birthtimeMs: libraryItemFolderStats.birthtimeMs || 0,
-          path: libraryItemData.path,
-          relPath: libraryItemData.relPath,
-          isFile,
-          mediaMetadata: libraryItemData.mediaMetadata || null,
-          libraryFiles: fileObjs
-        })
+            return new LibraryItemScanData({
+              libraryFolderId: folder.id,
+              libraryId: folder.libraryId,
+              mediaType: library.mediaType,
+              ino: libraryItemFolderStats.ino,
+              mtimeMs: libraryItemFolderStats.mtimeMs || 0,
+              ctimeMs: libraryItemFolderStats.ctimeMs || 0,
+              birthtimeMs: libraryItemFolderStats.birthtimeMs || 0,
+              path: libraryItemData.path,
+              relPath: libraryItemData.relPath,
+              isFile,
+              mediaMetadata: libraryItemData.mediaMetadata || null,
+              libraryFiles: fileObjs
+            })
+          })
+        )
       )
-    }
+    ).filter(Boolean)
+
     return items
   }
 

@@ -1,5 +1,6 @@
 const Path = require('path')
 const { Storage } = require('@google-cloud/storage')
+const { LRUCache } = require('lru-cache')
 const Logger = require('../../Logger')
 const fileUtils = require('../../utils/fileUtils')
 
@@ -29,6 +30,7 @@ class GcsStorageProvider {
     this.type = 'gcs'
     this.defaultBucketName = config.bucketName || process.env.GCS_BUCKET_NAME || process.env.GCS_DEFAULT_BUCKET || null
     this.signedUrlExpiryHours = Number(process.env.GCS_SIGNED_URL_EXPIRY_HOURS) || 6
+    this._statCache = new LRUCache({ max: 50000, ttl: 1000 * 60 * 15 })
 
     const storageOptions = {}
     const keyFile = config.keyFilename || process.env.GCS_KEY_FILE || process.env.GOOGLE_APPLICATION_CREDENTIALS
@@ -51,6 +53,15 @@ class GcsStorageProvider {
       Logger.info(`[GcsStorageProvider] Initialized for default bucket "${this.defaultBucketName}"`)
     } else {
       Logger.info(`[GcsStorageProvider] Initialized without default bucket (dynamic URI mode)`)
+    }
+  }
+
+  clearStatCache(path = null) {
+    if (path) {
+      const { uri } = this.parsePath(path)
+      this._statCache.delete(uri)
+    } else {
+      this._statCache.clear()
     }
   }
 
@@ -133,7 +144,9 @@ class GcsStorageProvider {
 
   async pathExists(path) {
     try {
-      const { bucketName, key } = this.parsePath(path)
+      const { bucketName, key, uri } = this.parsePath(path)
+      if (this._statCache.has(uri)) return true
+
       if (!key) {
         try {
           const [exists] = await this.getBucket(bucketName).exists()
@@ -170,10 +183,13 @@ class GcsStorageProvider {
   async stat(path) {
     try {
       const { bucketName, key, uri } = this.parsePath(path)
+      const cached = this._statCache.get(uri)
+      if (cached) return cached
+
       const bucket = this.getBucket(bucketName)
 
       if (!key) {
-        return {
+        const rootStat = {
           size: 0,
           mtimeMs: Date.now(),
           ctimeMs: Date.now(),
@@ -182,6 +198,8 @@ class GcsStorageProvider {
           isFile: false,
           ino: hashToIno(bucketName)
         }
+        this._statCache.set(uri, rootStat)
+        return rootStat
       }
 
       const file = bucket.file(key)
@@ -192,7 +210,7 @@ class GcsStorageProvider {
         const mtimeMs = metadata.updated ? new Date(metadata.updated).getTime() : Date.now()
         const ctimeMs = metadata.timeCreated ? new Date(metadata.timeCreated).getTime() : mtimeMs
 
-        return {
+        const statObj = {
           size: Number(metadata.size || 0),
           mtimeMs,
           ctimeMs,
@@ -201,13 +219,15 @@ class GcsStorageProvider {
           isFile: !isFolder,
           ino: hashToIno(metadata.generation || metadata.id || uri)
         }
+        this._statCache.set(uri, statObj)
+        return statObj
       }
 
       // Check if it represents an HNS folder
       const prefix = key.endsWith('/') ? key : `${key}/`
       const [childFiles] = await bucket.getFiles({ prefix, maxResults: 1 })
       if (childFiles.length > 0) {
-        return {
+        const dirStat = {
           size: 0,
           mtimeMs: Date.now(),
           ctimeMs: Date.now(),
@@ -216,6 +236,8 @@ class GcsStorageProvider {
           isFile: false,
           ino: hashToIno(uri)
         }
+        this._statCache.set(uri, dirStat)
+        return dirStat
       }
 
       return null
@@ -309,6 +331,37 @@ class GcsStorageProvider {
         if (relDir === '.') relDir = ''
         const deep = relDir ? relDir.split('/').length : 0
 
+        const fileStat = {
+          size: Number(file.metadata.size || 0),
+          mtimeMs,
+          ctimeMs,
+          birthtimeMs: ctimeMs,
+          isDirectory: false,
+          isFile: true,
+          ino: hashToIno(file.metadata.generation || file.id || fullname)
+        }
+        this._statCache.set(fullname, fileStat)
+
+        // Pre-cache ancestor directories so stat/getFileTimestampsWithIno returns immediately
+        let curDir = Path.posix.dirname(file.name)
+        while (curDir && curDir !== '.' && curDir !== '/') {
+          const dirUri = `gcs://${bucketName}/${curDir}`
+          if (!this._statCache.has(dirUri)) {
+            this._statCache.set(dirUri, {
+              size: 0,
+              mtimeMs,
+              ctimeMs,
+              birthtimeMs: ctimeMs,
+              isDirectory: true,
+              isFile: false,
+              ino: hashToIno(dirUri)
+            })
+          }
+          const parentDir = Path.posix.dirname(curDir)
+          if (parentDir === curDir) break
+          curDir = parentDir
+        }
+
         items.push({
           name: basename,
           path: relPath,
@@ -317,11 +370,11 @@ class GcsStorageProvider {
           fullname,
           extension: ext,
           deep,
-          size: Number(file.metadata.size || 0),
-          mtimeMs,
-          ctimeMs,
-          birthtimeMs: ctimeMs,
-          ino: hashToIno(file.metadata.generation || file.id || fullname)
+          size: fileStat.size,
+          mtimeMs: fileStat.mtimeMs,
+          ctimeMs: fileStat.ctimeMs,
+          birthtimeMs: fileStat.birthtimeMs,
+          ino: fileStat.ino
         })
       }
 
@@ -378,6 +431,7 @@ class GcsStorageProvider {
    * @param {string} newPath
    */
   async rename(oldPath, newPath) {
+    this.clearStatCache()
     const { bucketName: srcBucket, key: srcKey } = this.parsePath(oldPath)
     const { bucketName: destBucket, key: destKey } = this.parsePath(newPath)
     const bucket = this.getBucket(srcBucket)
@@ -419,6 +473,7 @@ class GcsStorageProvider {
   }
 
   async delete(path) {
+    this.clearStatCache(path)
     const { bucketName, key } = this.parsePath(path)
     const bucket = this.getBucket(bucketName)
 
@@ -448,6 +503,7 @@ class GcsStorageProvider {
   }
 
   async writeFile(path, data, options = {}) {
+    this.clearStatCache(path)
     const file = this.getFile(path)
     const metadata = {}
     if (options?.contentType) {

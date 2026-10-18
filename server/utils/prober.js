@@ -1,7 +1,21 @@
+const { LRUCache } = require('lru-cache')
 const ffprobe = require('../libs/nodeFfprobe')
 const MediaProbeData = require('../scanner/MediaProbeData')
-
 const Logger = require('../Logger')
+const { pLimit } = require('./asyncUtils')
+
+const PROBE_CONCURRENCY = parseInt(process.env.PROBE_CONCURRENCY || '8', 10)
+const probeLimit = pLimit(PROBE_CONCURRENCY)
+const rawProbeCache = new LRUCache({ max: 10000, ttl: 1000 * 60 * 60 })
+const inFlightProbes = new Map()
+
+function clearProbeCache(filepath = null) {
+  if (filepath) {
+    rawProbeCache.delete(filepath)
+  } else {
+    rawProbeCache.clear()
+  }
+}
 
 function tryGrabBitRate(stream, all_streams, total_bit_rate) {
   if (!isNaN(stream.bit_rate) && stream.bit_rate) {
@@ -325,6 +339,40 @@ module.exports.probe = probe
  * @returns {Object} ffprobe json output
  */
 async function rawProbe(filepath) {
+  if (!filepath) {
+    return {
+      error: 'Invalid filepath'
+    }
+  }
+
+  const cacheKey = typeof filepath === 'string' ? filepath : String(filepath)
+  const cached = rawProbeCache.get(cacheKey)
+  if (cached) {
+    return cached
+  }
+
+  if (inFlightProbes.has(cacheKey)) {
+    return inFlightProbes.get(cacheKey)
+  }
+
+  const probePromise = probeLimit(async () => {
+    return executeRawProbe(filepath)
+  })
+
+  inFlightProbes.set(cacheKey, probePromise)
+
+  try {
+    const res = await probePromise
+    if (res && !res.error) {
+      rawProbeCache.set(cacheKey, res)
+    }
+    return res
+  } finally {
+    inFlightProbes.delete(cacheKey)
+  }
+}
+
+async function executeRawProbe(filepath) {
   if (process.env.FFPROBE_PATH) {
     ffprobe.FFPROBE_PATH = process.env.FFPROBE_PATH
   }
@@ -371,4 +419,5 @@ async function rawProbe(filepath) {
   }
 }
 module.exports.rawProbe = rawProbe
+module.exports.clearProbeCache = clearProbeCache
 

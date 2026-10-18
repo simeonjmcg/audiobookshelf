@@ -108,6 +108,28 @@ describe('StorageManager & Providers', () => {
     })
   })
 
+  describe('GcsStorageProvider stat caching', () => {
+    it('should return cached stat without making GCS API calls', async () => {
+      const uri = 'gcs://smcgraw-abs-lib/Brandon Sanderson/The Way of Kings'
+      gcsProvider._statCache.set(uri, {
+        size: 0,
+        mtimeMs: 12345,
+        ctimeMs: 12345,
+        birthtimeMs: 12345,
+        isDirectory: true,
+        isFile: false,
+        ino: '999999'
+      })
+
+      const statRes = await gcsProvider.stat(uri)
+      expect(statRes.ino).to.equal('999999')
+      expect(await gcsProvider.pathExists(uri)).to.be.true
+
+      gcsProvider.clearStatCache(uri)
+      expect(gcsProvider._statCache.has(uri)).to.be.false
+    })
+  })
+
   describe('fileUtils GCS delegation', () => {
     const fileUtils = require('../../../server/utils/fileUtils')
 
