@@ -28,7 +28,7 @@ permissions:
 
 jobs:
   build:
-    if: ${{ !contains(github.event.head_commit.message, 'skip ci') && (github.repository_owner == 'simeonjmcg' || github.repository == 'advplyr/audiobookshelf' || github.repository == 'kevingatera/audiobookshelf') }}
+    if: ${{ !contains(github.event.head_commit.message, 'skip ci') && (github.repository_owner == 'simeonjmcg' || github.repository == 'advplyr/audiobookshelf') }}
     runs-on: ubuntu-24.04
 
     steps:
