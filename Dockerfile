@@ -1,8 +1,8 @@
 ARG NUSQLITE3_DIR="/usr/local/lib/nusqlite3"
 ARG NUSQLITE3_PATH="${NUSQLITE3_DIR}/libnusqlite3.so"
 
-### STAGE 0: Build client ###
-FROM node:24-alpine AS build-client
+### STAGE 0: Build client on the builder CPU (avoid QEMU SIGILL on arm64) ###
+FROM --platform=$BUILDPLATFORM node:24-alpine AS build-client
 
 WORKDIR /client
 COPY /client /client
