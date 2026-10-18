@@ -159,7 +159,7 @@ class Book extends Model {
         language: DataTypes.STRING,
         explicit: DataTypes.BOOLEAN,
         abridged: DataTypes.BOOLEAN,
-        coverPath: DataTypes.STRING,
+        coverPath: DataTypes.TEXT,
         duration: DataTypes.FLOAT,
 
         narrators: DataTypes.JSON,

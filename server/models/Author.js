@@ -142,7 +142,7 @@ class Author extends Model {
         lastFirst: DataTypes.STRING,
         asin: DataTypes.STRING,
         description: DataTypes.TEXT,
-        imagePath: DataTypes.STRING
+        imagePath: DataTypes.TEXT
       },
       {
         sequelize,

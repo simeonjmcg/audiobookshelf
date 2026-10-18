@@ -151,7 +151,7 @@ class Podcast extends Model {
         lastEpisodeCheck: DataTypes.DATE,
         maxEpisodesToKeep: DataTypes.INTEGER,
         maxNewEpisodesToDownload: DataTypes.INTEGER,
-        coverPath: DataTypes.STRING,
+        coverPath: DataTypes.TEXT,
         tags: DataTypes.JSON,
         genres: DataTypes.JSON,
         numEpisodes: DataTypes.INTEGER

@@ -729,8 +729,8 @@ class LibraryItem extends Model {
           primaryKey: true
         },
         ino: DataTypes.STRING,
-        path: DataTypes.STRING,
-        relPath: DataTypes.STRING,
+        path: DataTypes.TEXT,
+        relPath: DataTypes.TEXT,
         mediaId: DataTypes.UUID,
         mediaType: DataTypes.STRING,
         isFile: DataTypes.BOOLEAN,

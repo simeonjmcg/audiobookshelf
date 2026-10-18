@@ -7,8 +7,8 @@ on:
     inputs:
       tags:
         description: 'Docker Tag'
-        required: true
-        default: 'latest'
+        required: false
+        default: 'latest-gcs'
   push:
     branches: [main, master]
     tags:
@@ -28,7 +28,7 @@ permissions:
 
 jobs:
   build:
-    if: ${{ !contains(github.event.head_commit.message, 'skip ci') && (github.repository == 'advplyr/audiobookshelf' || github.repository == 'kevingatera/audiobookshelf') }}
+    if: ${{ !contains(github.event.head_commit.message, 'skip ci') && (github.repository_owner == 'simeonjmcg' || github.repository == 'advplyr/audiobookshelf') }}
     runs-on: ubuntu-24.04
 
     steps:
@@ -39,8 +39,12 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: advplyr/audiobookshelf,ghcr.io/${{ github.repository_owner }}/audiobookshelf
+          images: |
+            ghcr.io/${{ github.repository_owner }}/audiobookshelf
+            ${{ github.repository == 'advplyr/audiobookshelf' && 'advplyr/audiobookshelf' || '' }}
           tags: |
+            type=raw,value=latest-gcs
+            type=raw,value=${{ github.event.inputs.tags }},enable=${{ github.event.inputs.tags != '' && github.event.inputs.tags != 'latest-gcs' }}
             type=edge,branch=master
             type=semver,pattern={{version}}
 
@@ -75,7 +79,7 @@ jobs:
       - name: Build image
         uses: docker/build-push-action@v6
         with:
-          tags: ${{ github.event.inputs.tags || steps.meta.outputs.tags }}
+          tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           context: .
           platforms: linux/amd64,linux/arm64
