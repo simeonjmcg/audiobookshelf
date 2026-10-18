@@ -19,6 +19,7 @@ const RssFeedManager = require('../managers/RssFeedManager')
 const CacheManager = require('../managers/CacheManager')
 const CoverManager = require('../managers/CoverManager')
 const ShareManager = require('../managers/ShareManager')
+const StorageManager = require('../storage/StorageManager')
 
 /**
  * @typedef RequestUserObject
@@ -177,6 +178,42 @@ class LibraryItemController {
     Logger.info(`[LibraryItemController] User "${req.user.username}" requested download for item "${itemTitle}" at "${libraryItemPath}"`)
 
     try {
+      if (StorageManager.isGcsPath(libraryItemPath) && (req.libraryItem.isFile || req.libraryItem.libraryFiles?.length === 1)) {
+        const targetFile = req.libraryItem.libraryFiles?.[0]
+        const filePath = targetFile?.metadata?.path || libraryItemPath
+        const filename = targetFile?.metadata?.filename || req.libraryItem.relPath || Path.basename(filePath)
+        const audioMimeType = getAudioMimeTypeFromExtname(Path.extname(filename))
+        try {
+          const signedUrl = await StorageManager.getSignedUrl(filePath, {
+            responseType: audioMimeType,
+            responseDisposition: `attachment; filename="${filename}"`
+          })
+          if (signedUrl) {
+            Logger.debug(`[LibraryItemController] Redirecting single-file item download to GCS signed URL`)
+            return res.redirect(signedUrl)
+          }
+        } catch (err) {
+          Logger.warn(`[LibraryItemController] Signed URL unavailable for download "${filePath}" (${err.message}), piping download...`)
+        }
+
+        try {
+          const gcsProvider = StorageManager.getProvider(filePath)
+          const file = gcsProvider.getFile(filePath)
+          const [metadata] = await file.getMetadata()
+          res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`)
+          if (audioMimeType) {
+            res.setHeader('Content-Type', audioMimeType)
+          }
+          res.setHeader('Content-Length', metadata.size)
+          const stream = file.createReadStream()
+          req.on('close', () => stream.destroy())
+          return stream.pipe(res)
+        } catch (dlErr) {
+          Logger.error(`[LibraryItemController] Failed to pipe GCS download "${filePath}": ${dlErr.message}`)
+          return res.sendStatus(500)
+        }
+      }
+
       // If library item is a single file in root dir then no need to zip
       if (req.libraryItem.isFile) {
         // Express does not set the correct mimetype for m4b files so use our defined mimetypes if available

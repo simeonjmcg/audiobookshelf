@@ -11,6 +11,7 @@ const zipHelpers = require('../utils/zipHelpers')
 
 const PlaybackSession = require('../objects/PlaybackSession')
 const ShareManager = require('../managers/ShareManager')
+const StorageManager = require('../storage/StorageManager')
 
 /**
  * @typedef RequestUserObject
@@ -261,7 +262,30 @@ class ShareController {
     Logger.info(`[ShareController] Requested download for book "${itemTitle}" at "${itemPath}"`)
 
     try {
-      if (libraryItem.isFile) {
+      if (StorageManager.isGcsPath(itemPath)) {
+        if (libraryItem.isFile) {
+          const audioMimeType = getAudioMimeTypeFromExtname(Path.extname(itemPath))
+          const downloadFilename = Path.basename(libraryItem.relPath || itemPath)
+          const signedUrl = await StorageManager.getSignedUrl(itemPath, {
+            action: 'read',
+            expiresInSeconds: 3600,
+            responseDisposition: `attachment; filename="${downloadFilename}"`,
+            responseType: audioMimeType
+          })
+          if (signedUrl) {
+            return res.redirect(signedUrl)
+          }
+          res.setHeader('Content-Disposition', `attachment; filename="${downloadFilename}"`)
+          if (audioMimeType) {
+            res.setHeader('Content-Type', audioMimeType)
+          }
+          const stream = StorageManager.createReadStream(itemPath)
+          return stream.pipe(res)
+        } else {
+          const filename = `${itemTitle}.zip`
+          await zipHelpers.zipDirectoryPipe(itemPath, filename, res)
+        }
+      } else if (libraryItem.isFile) {
         const audioMimeType = getAudioMimeTypeFromExtname(Path.extname(itemPath))
         if (audioMimeType) {
           res.setHeader('Content-Type', audioMimeType)

@@ -539,8 +539,10 @@ class GcsStorageProvider {
       expires: expires
     }
 
-    if (options.contentType) {
+    if (options.action === 'write' && options.contentType) {
       config.contentType = options.contentType
+    } else if (options.responseType || options.contentType) {
+      config.responseType = options.responseType || options.contentType
     }
     if (options.responseDisposition) {
       config.responseDisposition = options.responseDisposition
