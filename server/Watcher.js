@@ -42,6 +42,8 @@ class FolderWatcher extends EventEmitter {
 
     this.disabled = false
 
+    this.pendingFolderRenames = []
+
     this.gcsWatcher = new GcsWatcher(this)
   }
 
@@ -235,17 +237,45 @@ class FolderWatcher extends EventEmitter {
   }
 
   /**
+   * Watcher detected folder renamed
+   *
+   * @param {string} libraryId
+   * @param {string} oldPath
+   * @param {string} newPath
+   */
+  onFolderRenamed(libraryId, oldPath, newPath) {
+    if (!oldPath || !newPath) return
+    oldPath = filePathToPOSIX(oldPath)
+    newPath = filePathToPOSIX(newPath)
+    if (oldPath.endsWith('/')) oldPath = oldPath.slice(0, -1)
+    if (newPath.endsWith('/')) newPath = newPath.slice(0, -1)
+
+    if (this.checkShouldIgnorePath(newPath)) {
+      return
+    }
+
+    Logger.debug(`[Watcher] Folder Renamed ${oldPath} => ${newPath}`)
+    this.pendingFolderRenames.push({ libraryId, oldPath, newPath })
+    this.addFileUpdate(libraryId, newPath, 'renamed', oldPath, true)
+  }
+
+  /**
    * Watcher detected file renamed
    *
    * @param {string} libraryId
-   * @param {string} path
+   * @param {string} pathFrom
+   * @param {string} pathTo
    */
   onFileRename(libraryId, pathFrom, pathTo) {
+    if (!pathFrom || !pathTo) return
+    pathFrom = filePathToPOSIX(pathFrom)
+    pathTo = filePathToPOSIX(pathTo)
+
     if (this.checkShouldIgnorePath(pathTo)) {
       return
     }
     Logger.debug(`[Watcher] Rename ${pathFrom} => ${pathTo}`)
-    this.addFileUpdate(libraryId, pathTo, 'renamed')
+    this.addFileUpdate(libraryId, pathTo, 'renamed', pathFrom, false)
   }
 
   /**
@@ -289,10 +319,30 @@ class FolderWatcher extends EventEmitter {
    * @param {string} libraryId
    * @param {string} path
    * @param {string} type
+   * @param {string} [oldPath=null]
+   * @param {boolean} [isDir=false]
    * @returns {boolean} - If file was added to pending updates
    */
-  addFileUpdate(libraryId, path, type) {
-    if (this.pendingFilePaths.includes(path)) return false
+  addFileUpdate(libraryId, path, type, oldPath = null, isDir = false) {
+    path = filePathToPOSIX(path)
+    if (path.endsWith('/') && path.length > 1) {
+      path = path.slice(0, -1)
+    }
+
+    // Check if path is already pending
+    const existing = this.pendingFileUpdates.find((pfu) => pfu.path === path)
+    if (existing) {
+      if (type === 'deleted' && existing.type === 'added') {
+        Logger.debug(`[Watcher] Cancelling added file immediately deleted: "${path}"`)
+        this.pendingFileUpdates = this.pendingFileUpdates.filter((pfu) => pfu.path !== path)
+        this.filesBeingAdded.delete(path)
+        return true
+      }
+      existing.type = type
+      if (oldPath) existing.oldPath = oldPath
+      if (isDir) existing.isDir = true
+      return true
+    }
 
     // Get file library
     const libwatcher = this.libraryWatchers.find((lw) => lw.id === libraryId)
@@ -309,17 +359,18 @@ class FolderWatcher extends EventEmitter {
     }
 
     const folderPath = filePathToPOSIX(folder.path)
-
     const relPath = path.replace(folderPath, '')
 
-    // Check for ignored extensions or directories, such as dotfiles and hidden directories
-    const shouldIgnore = shouldIgnoreFile(relPath)
-    if (shouldIgnore) {
-      Logger.debug(`[Watcher] Ignoring ${shouldIgnore} - "${relPath}"`)
-      return false
+    // Check for ignored extensions or directories, such as dotfiles and hidden directories (skip if directory)
+    if (!isDir) {
+      const shouldIgnore = shouldIgnoreFile(relPath)
+      if (shouldIgnore) {
+        Logger.debug(`[Watcher] Ignoring ${shouldIgnore} - "${relPath}"`)
+        return false
+      }
     }
 
-    Logger.debug(`[Watcher] Modified file in library "${libwatcher.name}" and folder "${folder.id}" with relPath "${relPath}"`)
+    Logger.debug(`[Watcher] Modified file in library "${libwatcher.name}" and folder "${folder.id}" with relPath "${relPath}" (type=${type})`)
 
     if (!this.pendingTask) {
       const taskData = {
@@ -333,16 +384,160 @@ class FolderWatcher extends EventEmitter {
       }
       this.pendingTask = TaskManager.createAndAddTask('watcher-scan', taskTitleString, null, true, taskData)
     }
-    this.pendingFileUpdates.push({
+
+    const updateObj = {
       path,
       relPath,
       folderId: folder.id,
       libraryId,
       type
-    })
+    }
+    if (oldPath) updateObj.oldPath = oldPath
+    if (isDir) updateObj.isDir = true
+
+    this.pendingFileUpdates.push(updateObj)
 
     this.handlePendingFileUpdatesTimeout()
     return true
+  }
+
+  /**
+   * Collapse rename, delete, and add events during the debounce window
+   */
+  collapsePendingFileUpdates() {
+    if (!this.pendingFileUpdates.length && !this.pendingFolderRenames.length) return
+
+    // 1. Process explicit folder renames
+    if (this.pendingFolderRenames.length) {
+      for (const rename of this.pendingFolderRenames) {
+        const { oldPath, newPath, libraryId } = rename
+        const oldPrefix = oldPath + '/'
+        const newPrefix = newPath + '/'
+
+        // Remove any deleted updates that fall under oldPath
+        this.pendingFileUpdates = this.pendingFileUpdates.filter((u) => {
+          if (u.type === 'deleted' && (u.path === oldPath || u.path.startsWith(oldPrefix))) {
+            Logger.debug(`[Watcher] Collapsing deleted update under renamed folder: "${u.path}"`)
+            return false
+          }
+          return true
+        })
+
+        // For any added updates under newPath, convert to renamed with corresponding oldPath
+        let hasNewPathUpdate = false
+        for (const u of this.pendingFileUpdates) {
+          if (u.path === newPath) {
+            u.type = 'renamed'
+            u.oldPath = oldPath
+            u.isDir = true
+            hasNewPathUpdate = true
+          } else if (u.path.startsWith(newPrefix)) {
+            u.type = 'renamed'
+            u.oldPath = oldPath + u.path.slice(newPath.length)
+            hasNewPathUpdate = true
+          }
+        }
+
+        // If no update exists for newPath, ensure an entry exists
+        if (!hasNewPathUpdate) {
+          const libwatcher = this.libraryWatchers.find((lw) => lw.id === libraryId)
+          const folder = libwatcher?.libraryFolders?.find((fold) => isSameOrSubPath(fold.path, newPath))
+          if (folder) {
+            const folderPath = filePathToPOSIX(folder.path)
+            const relPath = newPath.replace(folderPath, '')
+            this.pendingFileUpdates.push({
+              path: newPath,
+              relPath,
+              folderId: folder.id,
+              libraryId,
+              type: 'renamed',
+              oldPath,
+              isDir: true
+            })
+          }
+        }
+      }
+    }
+
+    // 2. Remove redundant deleted updates for any update that already has oldPath
+    const oldPathsInRenames = new Set(
+      this.pendingFileUpdates.filter((u) => u.type === 'renamed' && u.oldPath).map((u) => u.oldPath)
+    )
+    if (oldPathsInRenames.size > 0) {
+      this.pendingFileUpdates = this.pendingFileUpdates.filter((u) => {
+        if (u.type === 'deleted' && oldPathsInRenames.has(u.path)) {
+          Logger.debug(`[Watcher] Collapsing deleted update matching renamed oldPath: "${u.path}"`)
+          return false
+        }
+        return true
+      })
+    }
+
+    // 3. File-level pairing of deleted + added in the same directory or matching filename
+    const deletedUpdates = this.pendingFileUpdates.filter((u) => u.type === 'deleted' && !u.isDir)
+    const addedUpdates = this.pendingFileUpdates.filter((u) => u.type === 'added' && !u.isDir)
+
+    if (deletedUpdates.length > 0 && addedUpdates.length > 0) {
+      const deletedByDir = new Map()
+      for (const del of deletedUpdates) {
+        const dir = Path.dirname(del.path)
+        if (!deletedByDir.has(dir)) deletedByDir.set(dir, [])
+        deletedByDir.get(dir).push(del)
+      }
+
+      const addedByDir = new Map()
+      for (const add of addedUpdates) {
+        const dir = Path.dirname(add.path)
+        if (!addedByDir.has(dir)) addedByDir.set(dir, [])
+        addedByDir.get(dir).push(add)
+      }
+
+      const pairedDeletedPaths = new Set()
+
+      // Case 3a: Exactly 1 delete and 1 add in the same directory
+      for (const [dir, adds] of addedByDir.entries()) {
+        const dels = deletedByDir.get(dir)
+        if (dels && dels.length === 1 && adds.length === 1) {
+          const del = dels[0]
+          const add = adds[0]
+          if (!pairedDeletedPaths.has(del.path)) {
+            Logger.debug(`[Watcher] Collapsing 1-to-1 delete/add in "${dir}" into rename: "${del.path}" => "${add.path}"`)
+            add.type = 'renamed'
+            add.oldPath = del.path
+            pairedDeletedPaths.add(del.path)
+          }
+        } else if (dels && dels.length > 1 && adds.length > 1) {
+          // Case 3b: Match by unique same extension in directory
+          for (const add of adds) {
+            const ext = Path.extname(add.path).toLowerCase()
+            const matchingDel = dels.find((d) => !pairedDeletedPaths.has(d.path) && Path.extname(d.path).toLowerCase() === ext)
+            if (matchingDel && adds.filter((a) => Path.extname(a.path).toLowerCase() === ext).length === 1 && dels.filter((d) => Path.extname(d.path).toLowerCase() === ext).length === 1) {
+              Logger.debug(`[Watcher] Collapsing matching extension delete/add in "${dir}" into rename: "${matchingDel.path}" => "${add.path}"`)
+              add.type = 'renamed'
+              add.oldPath = matchingDel.path
+              pairedDeletedPaths.add(matchingDel.path)
+            }
+          }
+        }
+      }
+
+      // Case 3c: Matching filename moved across directories (same folderId)
+      for (const add of addedUpdates) {
+        if (add.type === 'renamed') continue
+        const addFilename = Path.basename(add.path)
+        const matchingDel = deletedUpdates.find((d) => !pairedDeletedPaths.has(d.path) && Path.basename(d.path) === addFilename && d.folderId === add.folderId)
+        if (matchingDel) {
+          Logger.debug(`[Watcher] Collapsing cross-dir file move into rename: "${matchingDel.path}" => "${add.path}"`)
+          add.type = 'renamed'
+          add.oldPath = matchingDel.path
+          pairedDeletedPaths.add(matchingDel.path)
+        }
+      }
+
+      if (pairedDeletedPaths.size > 0) {
+        this.pendingFileUpdates = this.pendingFileUpdates.filter((u) => !pairedDeletedPaths.has(u.path))
+      }
+    }
   }
 
   /**
@@ -358,6 +553,8 @@ class FolderWatcher extends EventEmitter {
         return this.handlePendingFileUpdatesTimeout()
       }
 
+      this.collapsePendingFileUpdates()
+
       if (this.pendingFileUpdates.length) {
         this.emit('scanFilesChanged', this.pendingFileUpdates, this.pendingTask)
       } else {
@@ -365,11 +562,14 @@ class FolderWatcher extends EventEmitter {
           text: 'No files to scan',
           key: 'MessageTaskNoFilesToScan'
         }
-        this.pendingTask.setFinished(taskFinishedString)
-        TaskManager.taskFinished(this.pendingTask)
+        if (this.pendingTask) {
+          this.pendingTask.setFinished(taskFinishedString)
+          TaskManager.taskFinished(this.pendingTask)
+        }
       }
       this.pendingTask = null
       this.pendingFileUpdates = []
+      this.pendingFolderRenames = []
       this.filesBeingAdded.clear()
     }, this.pendingDelay)
   }

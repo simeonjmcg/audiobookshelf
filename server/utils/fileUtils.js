@@ -314,7 +314,10 @@ module.exports.getFilePathItemFromFileUpdate = (fileUpdate) => {
     reldirpath: dirname === '.' ? '' : dirname,
     fullpath: fileUpdate.path,
     extension: Path.extname(relPath),
-    deep: relPath.split('/').length - 1
+    deep: relPath.split('/').length - 1,
+    isDir: fileUpdate.isDir || false,
+    oldPath: fileUpdate.oldPath || null,
+    type: fileUpdate.type || null
   }
 }
 

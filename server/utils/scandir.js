@@ -58,7 +58,7 @@ function groupFileItemsIntoLibraryItemDirs(mediaType, fileItems, audiobooksOnly,
   /** @type {import('./fileUtils').FilePathItem[]} */
   const otherFileItems = []
   itemsFiltered.forEach((item) => {
-    if (isMediaFile(mediaType, item.extension, audiobooksOnly) || (includeNonMediaFiles && isScannableNonMediaFile(item.extension))) {
+    if (isMediaFile(mediaType, item.extension, audiobooksOnly) || (includeNonMediaFiles && isScannableNonMediaFile(item.extension)) || (includeNonMediaFiles && (item.isDir || item.type === 'renamed'))) {
       mediaFileItems.push(item)
     } else {
       otherFileItems.push(item)
@@ -68,6 +68,13 @@ function groupFileItemsIntoLibraryItemDirs(mediaType, fileItems, audiobooksOnly,
   // Step 3: Group media files (or non-media files if includeNonMediaFiles is true) in library items
   const libraryItemGroup = {}
   mediaFileItems.forEach((item) => {
+    if (item.isDir) {
+      const cleanPath = item.path.replace(/^\/+/, '').replace(/\/+$/, '')
+      if (cleanPath) {
+        libraryItemGroup[cleanPath] = libraryItemGroup[cleanPath] || []
+      }
+      return
+    }
     const dirparts = item.reldirpath.split('/').filter((p) => !!p)
     const numparts = dirparts.length
     let _path = ''

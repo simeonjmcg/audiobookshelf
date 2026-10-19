@@ -222,11 +222,15 @@ class GcsWatcher {
       const { library, folder } = match
 
       // Queue file updates on the renamed folder so Scanner rescans the changed directory
-      if (src && srcMatch) {
-        this.folderWatcher.onFileRemoved(library.id, src.path)
-      }
-      if (dest && destMatch) {
-        this.folderWatcher.onFileAdded(library.id, dest.path)
+      if (src && dest && srcMatch && destMatch && typeof this.folderWatcher.onFolderRenamed === 'function') {
+        this.folderWatcher.onFolderRenamed(library.id, src.path, dest.path)
+      } else {
+        if (src && srcMatch) {
+          this.folderWatcher.onFileRemoved(library.id, src.path)
+        }
+        if (dest && destMatch) {
+          this.folderWatcher.onFileAdded(library.id, dest.path)
+        }
       }
     } catch (err) {
       Logger.error(`[GcsWatcher] Failed to handle folder rename audit log: ${err.message}`)

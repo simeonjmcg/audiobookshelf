@@ -518,7 +518,7 @@ class LibraryScanner {
         Logger.info(`[LibraryScanner] No important changes to scan for in folder "${folderId}"`)
         continue
       }
-      const folderScanResults = await this.scanFolderUpdates(library, folder, fileUpdateGroup)
+      const folderScanResults = await this.scanFolderUpdates(library, folder, fileUpdateGroup, folderGroups[folderId].fileUpdates)
       Logger.debug(`[LibraryScanner] Folder scan results`, folderScanResults)
 
       // Tally results to share with client
@@ -592,9 +592,10 @@ class LibraryScanner {
    * @param {import('../models/Library')} library
    * @param {import('../models/LibraryFolder')} folder
    * @param {Record<string, string[]>} fileUpdateGroup
+   * @param {import('../Watcher').PendingFileUpdate[]} [folderFileUpdates=[]]
    * @returns {Promise<Record<string,number>>}
    */
-  async scanFolderUpdates(library, folder, fileUpdateGroup) {
+  async scanFolderUpdates(library, folder, fileUpdateGroup, folderFileUpdates = []) {
     // Make sure library filter data is set
     //   this is used to check for existing authors & series
     await libraryFilters.getFilterData(library.mediaType, library.id)
@@ -672,16 +673,79 @@ class LibraryScanner {
 
       let updatedLibraryItemDetails = {}
       if (!existingLibraryItem) {
-        const isSingleMedia = isSingleMediaFile(fileUpdateGroup, itemDir)
-        existingLibraryItem = (await findLibraryItemByItemToItemInoMatch(library.id, fullPath)) || (await findLibraryItemByItemToFileInoMatch(library.id, fullPath, isSingleMedia)) || (await findLibraryItemByFileToItemInoMatch(library.id, fullPath, isSingleMedia, fileUpdateGroup[itemDir]))
-        if (existingLibraryItem) {
-          // Update library item paths for scan
-          existingLibraryItem.path = fullPath
-          existingLibraryItem.relPath = itemDir
-          updatedLibraryItemDetails.path = fullPath
-          updatedLibraryItemDetails.relPath = itemDir
-          updatedLibraryItemDetails.libraryFolderId = folder.id
-          updatedLibraryItemDetails.isFile = isSingleMedia
+        // If not found by path, check if this update was a rename from oldPath
+        if (folderFileUpdates?.length) {
+          const matchedUpdate = folderFileUpdates.find((u) => u.oldPath && (u.path === fullPath || u.path.startsWith(fullPath + '/')))
+          if (matchedUpdate) {
+            let oldFullPath = matchedUpdate.oldPath
+            if (matchedUpdate.path.length > fullPath.length) {
+              const relSuffix = matchedUpdate.path.slice(fullPath.length)
+              if (oldFullPath.endsWith(relSuffix)) {
+                oldFullPath = oldFullPath.slice(0, -relSuffix.length)
+              }
+            }
+            Logger.info(`[LibraryScanner] Looking for existing library item by oldPath "${oldFullPath}" for rename to "${fullPath}"`)
+            const oldItemDirParts = oldFullPath.split('/').slice(0, -1)
+            const potentialOldDirs = [oldFullPath]
+            for (let i = 0; i < oldItemDirParts.length; i++) {
+              potentialOldDirs.push(
+                oldFullPath.split('/').slice(0, -1 - i).join('/')
+              )
+            }
+            existingLibraryItem = await Database.libraryItemModel.findOneExpanded({
+              libraryId: library.id,
+              path: potentialOldDirs
+            })
+            if (existingLibraryItem) {
+              const isSingleMedia = isSingleMediaFile(fileUpdateGroup, itemDir)
+              Logger.info(`[LibraryScanner] Found existing library item "${existingLibraryItem.media?.title || existingLibraryItem.id}" by oldPath "${oldFullPath}" - updating to "${fullPath}"`)
+              existingLibraryItem.path = fullPath
+              existingLibraryItem.relPath = itemDir
+              updatedLibraryItemDetails.path = fullPath
+              updatedLibraryItemDetails.relPath = itemDir
+              updatedLibraryItemDetails.libraryFolderId = folder.id
+              updatedLibraryItemDetails.isFile = isSingleMedia
+            } else if (matchedUpdate.isDir) {
+              // Check if any existing library items were children of oldFullPath (e.g. renamed author folder)
+              const oldChildren = await Database.libraryItemModel.findAllExpandedWhere({
+                libraryId: library.id,
+                path: {
+                  [sequelize.Op.startsWith]: oldFullPath + '/'
+                }
+              })
+              if (oldChildren?.length) {
+                Logger.info(`[LibraryScanner] Found ${oldChildren.length} existing child library items under oldPath "${oldFullPath}" - updating to "${fullPath}"`)
+                for (const childItem of oldChildren) {
+                  const newChildFullPath = childItem.path.replace(oldFullPath, fullPath)
+                  const newChildRelPath = childItem.relPath ? childItem.relPath.replace(matchedUpdate.oldPath, matchedUpdate.path) : itemDir
+                  childItem.path = newChildFullPath
+                  childItem.relPath = newChildRelPath
+                  const childItemDetails = {
+                    path: newChildFullPath,
+                    relPath: newChildRelPath,
+                    libraryFolderId: folder.id,
+                    isFile: childItem.isFile
+                  }
+                  itemGroupingResults[newChildRelPath] = await LibraryItemScanner.scanLibraryItem(childItem.id, childItemDetails)
+                }
+                continue
+              }
+            }
+          }
+        }
+
+        if (!existingLibraryItem) {
+          const isSingleMedia = isSingleMediaFile(fileUpdateGroup, itemDir)
+          existingLibraryItem = (await findLibraryItemByItemToItemInoMatch(library.id, fullPath)) || (await findLibraryItemByItemToFileInoMatch(library.id, fullPath, isSingleMedia)) || (await findLibraryItemByFileToItemInoMatch(library.id, fullPath, isSingleMedia, fileUpdateGroup[itemDir]))
+          if (existingLibraryItem) {
+            // Update library item paths for scan
+            existingLibraryItem.path = fullPath
+            existingLibraryItem.relPath = itemDir
+            updatedLibraryItemDetails.path = fullPath
+            updatedLibraryItemDetails.relPath = itemDir
+            updatedLibraryItemDetails.libraryFolderId = folder.id
+            updatedLibraryItemDetails.isFile = isSingleMedia
+          }
         }
       }
       if (existingLibraryItem) {
