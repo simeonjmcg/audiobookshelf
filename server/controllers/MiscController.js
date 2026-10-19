@@ -43,12 +43,23 @@ class MiscController {
 
     if (isGcs) {
       try {
-        const GcsTusDataStore = require('../storage/GcsTusDataStore')
-        const bucket = gcsProvider.getBucket(gcsProvider.defaultBucketName)
-        datastore = new GcsTusDataStore({ bucket, prefix: 'metadata/tmp/tus/' })
-        Logger.info(`[MiscController] Tus server initialized with GcsTusDataStore on bucket "${gcsProvider.defaultBucketName}"`)
+        const { GCSStore } = require('@tus/gcs-store')
+        const rawBucket = gcsProvider.getBucket(gcsProvider.defaultBucketName)
+        const bucketProxy = new Proxy(rawBucket, {
+          get(target, prop) {
+            if (prop === 'file') {
+              return (name, options) => {
+                const prefixed = String(name).startsWith('metadata/tmp/tus/') ? name : `metadata/tmp/tus/${name}`
+                return target.file(prefixed, options)
+              }
+            }
+            return typeof target[prop] === 'function' ? target[prop].bind(target) : target[prop]
+          }
+        })
+        datastore = new GCSStore({ bucket: bucketProxy })
+        Logger.info(`[MiscController] Tus server initialized with GCSStore on bucket "${gcsProvider.defaultBucketName}"`)
       } catch (err) {
-        Logger.error('[MiscController] Failed to initialize GcsTusDataStore for Tus, falling back to local file store', err)
+        Logger.error('[MiscController] Failed to initialize GCSStore for Tus, falling back to local file store', err)
       }
     }
 

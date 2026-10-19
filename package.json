@@ -44,6 +44,7 @@
   "dependencies": {
     "@google-cloud/storage": "^8.4.0",
     "@tus/file-store": "^2.1.1",
+    "@tus/gcs-store": "^2.0.1",
     "@tus/server": "^2.4.5",
     "axios": "^0.27.2",
     "cookie-parser": "^1.4.6",
@@ -80,5 +81,10 @@
   },
   "allowScripts": {
     "sqlite3@5.1.7": true
+  },
+  "overrides": {
+    "@tus/gcs-store": {
+      "@google-cloud/storage": "$@google-cloud/storage"
+    }
   }
 }

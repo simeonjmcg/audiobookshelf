@@ -29,7 +29,7 @@ describe('MiscController Tus Resumable Uploads Multi-Replica Support', () => {
     expect(MiscController.tusServer.datastore).to.exist
   })
 
-  it('should initialize with GcsTusDataStore when GCS provider has default bucket', () => {
+  it('should initialize with GCSStore when GCS provider has default bucket', () => {
     const mockFile = sinon.stub().callsFake((name) => ({ name }))
     const mockBucket = {
       name: 'test-bucket',
@@ -48,6 +48,9 @@ describe('MiscController Tus Resumable Uploads Multi-Replica Support', () => {
     expect(MiscController.tusServer.datastore).to.exist
     expect(MiscController.tusServer.datastore.bucket).to.exist
     expect(MiscController.tusServer.datastore.bucket.name).to.equal('test-bucket')
-    expect(MiscController.tusServer.datastore.getFilePath('upload-uuid-123')).to.equal('metadata/tmp/tus/upload-uuid-123')
+
+    // Test bucket proxy prepending metadata/tmp/tus/
+    MiscController.tusServer.datastore.bucket.file('upload-uuid-123')
+    expect(mockFile.calledWith('metadata/tmp/tus/upload-uuid-123')).to.be.true
   })
 })
