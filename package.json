@@ -29,6 +29,7 @@
     "assets": [
       "client/dist/**/*",
       "node_modules/sqlite3/lib/binding/**/*.node",
+      "node_modules/srvx/**/*",
       "dist-server/server/migrations/*.js"
     ],
     "scripts": [
