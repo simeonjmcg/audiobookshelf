@@ -1,4 +1,5 @@
 const SocketIO = require('socket.io')
+const { v4: uuidv4 } = require('uuid')
 const Logger = require('./Logger')
 const Database = require('./Database')
 const TokenManager = require('./auth/TokenManager')
@@ -20,6 +21,12 @@ class SocketAuthority {
 
     /** @type {Object.<string, SocketClient>} */
     this.clients = {}
+
+    this.instanceId = uuidv4()
+    this.pgSubscriber = null
+    this.pgCleanupInterval = null
+    this.isClosing = false
+    this._reconnecting = false
   }
 
   /**
@@ -48,6 +55,73 @@ class SocketAuthority {
     return Object.values(this.clients).filter((c) => c.user?.id === userId)
   }
 
+  _dispatchLocally(msg) {
+    if (!msg || !msg.type) return
+    if (msg.type === 'emitter') {
+      const filter = msg.libraryId ? (user) => user.checkCanAccessLibrary?.(msg.libraryId) : null
+      for (const socketId in this.clients) {
+        if (this.clients[socketId].user) {
+          if (filter && !filter(this.clients[socketId].user)) continue
+          this.clients[socketId].socket.emit(msg.evt, msg.data)
+        }
+      }
+    } else if (msg.type === 'clientEmitter') {
+      const clients = this.getClientsForUser(msg.userId)
+      clients.forEach((client) => {
+        if (client.socket) client.socket.emit(msg.evt, msg.data)
+      })
+    } else if (msg.type === 'adminEmitter') {
+      for (const socketId in this.clients) {
+        if (this.clients[socketId].user?.isAdminOrUp) {
+          this.clients[socketId].socket.emit(msg.evt, msg.data)
+        }
+      }
+    } else if (msg.type === 'libraryItemEmitter') {
+      for (const socketId in this.clients) {
+        if (this.clients[socketId].user?.checkCanAccessLibraryItem(msg.expanded)) {
+          this.clients[socketId].socket.emit(msg.evt, msg.expanded)
+        }
+      }
+    } else if (msg.type === 'libraryItemsEmitter') {
+      for (const socketId in this.clients) {
+        if (this.clients[socketId].user) {
+          const libraryItemsAccessibleToUser = (msg.items || []).filter((li) => this.clients[socketId].user.checkCanAccessLibraryItem(li))
+          if (libraryItemsAccessibleToUser.length) {
+            this.clients[socketId].socket.emit(msg.evt, libraryItemsAccessibleToUser)
+          }
+        }
+      }
+    }
+  }
+
+  async publishBroadcast(msg) {
+    if (!Database.isPostgresDialect?.() || !Database.sequelize || this.isClosing) return
+    msg.origin = this.instanceId
+    try {
+      const json = JSON.stringify(msg)
+      if (json.length <= 7500) {
+        const escaped = json.replace(/'/g, "''")
+        await Database.sequelize.query(`NOTIFY abs_socket_events, '${escaped}';`)
+      } else {
+        const [result] = await Database.sequelize.query(
+          `INSERT INTO abs_broadcast_events (origin, payload) VALUES (:origin, :payload) RETURNING id;`,
+          {
+            replacements: {
+              origin: this.instanceId,
+              payload: json
+            }
+          }
+        )
+        const id = result[0]?.id
+        if (id) {
+          await Database.sequelize.query(`NOTIFY abs_socket_events, '{"id":${id},"origin":"${this.instanceId}"}';`)
+        }
+      }
+    } catch (err) {
+      Logger.error('[SocketAuthority] Error publishing broadcast message', err)
+    }
+  }
+
   /**
    * Emits event to all authorized clients
    * @param {string} evt
@@ -62,19 +136,23 @@ class SocketAuthority {
         this.clients[socketId].socket.emit(evt, data)
       }
     }
+    const libraryId = evt.startsWith('library_') && data?.id ? data.id : null
+    this.publishBroadcast({ type: 'emitter', evt, data, libraryId })
   }
 
   // Emits event to all clients for a specific user
   clientEmitter(userId, evt, data) {
     const clients = this.getClientsForUser(userId)
     if (!clients.length) {
-      return Logger.debug(`[SocketAuthority] clientEmitter - no clients found for user ${userId}`)
+      Logger.debug(`[SocketAuthority] clientEmitter - no local clients found for user ${userId}`)
+    } else {
+      clients.forEach((client) => {
+        if (client.socket) {
+          client.socket.emit(evt, data)
+        }
+      })
     }
-    clients.forEach((client) => {
-      if (client.socket) {
-        client.socket.emit(evt, data)
-      }
-    })
+    this.publishBroadcast({ type: 'clientEmitter', userId, evt, data })
   }
 
   // Emits event to all admin user clients
@@ -84,6 +162,7 @@ class SocketAuthority {
         this.clients[socketId].socket.emit(evt, data)
       }
     }
+    this.publishBroadcast({ type: 'adminEmitter', evt, data })
   }
 
   requireAdminSocket(socket, eventName) {
@@ -102,11 +181,13 @@ class SocketAuthority {
    * @param {import('./models/LibraryItem')} libraryItem
    */
   libraryItemEmitter(evt, libraryItem) {
+    const expanded = typeof libraryItem?.toOldJSONExpanded === 'function' ? libraryItem.toOldJSONExpanded() : libraryItem
     for (const socketId in this.clients) {
       if (this.clients[socketId].user?.checkCanAccessLibraryItem(libraryItem)) {
-        this.clients[socketId].socket.emit(evt, libraryItem.toOldJSONExpanded())
+        this.clients[socketId].socket.emit(evt, expanded)
       }
     }
+    this.publishBroadcast({ type: 'libraryItemEmitter', evt, expanded })
   }
 
   /**
@@ -117,17 +198,16 @@ class SocketAuthority {
    * @param {import('./models/LibraryItem')[]} libraryItems
    */
   libraryItemsEmitter(evt, libraryItems) {
+    const items = (libraryItems || []).map((li) => (typeof li?.toOldJSONExpanded === 'function' ? li.toOldJSONExpanded() : li))
     for (const socketId in this.clients) {
       if (this.clients[socketId].user) {
-        const libraryItemsAccessibleToUser = libraryItems.filter((li) => this.clients[socketId].user.checkCanAccessLibraryItem(li))
+        const libraryItemsAccessibleToUser = items.filter((li) => this.clients[socketId].user.checkCanAccessLibraryItem(li))
         if (libraryItemsAccessibleToUser.length) {
-          this.clients[socketId].socket.emit(
-            evt,
-            libraryItemsAccessibleToUser.map((li) => li.toOldJSONExpanded())
-          )
+          this.clients[socketId].socket.emit(evt, libraryItemsAccessibleToUser)
         }
       }
     }
+    this.publishBroadcast({ type: 'libraryItemsEmitter', evt, items })
   }
 
   /**
@@ -137,6 +217,17 @@ class SocketAuthority {
    */
   async close() {
     Logger.info('[SocketAuthority] closing...')
+    this.isClosing = true
+    if (this.pgCleanupInterval) {
+      clearInterval(this.pgCleanupInterval)
+      this.pgCleanupInterval = null
+    }
+    if (this.pgSubscriber) {
+      try {
+        await this.pgSubscriber.end()
+      } catch (e) {}
+      this.pgSubscriber = null
+    }
     const closePromises = this.socketIoServers.map((io) => {
       return new Promise((resolve) => {
         Logger.info(`[SocketAuthority] Closing Socket.IO server: ${io.path}`)
@@ -151,8 +242,101 @@ class SocketAuthority {
     this.socketIoServers = []
   }
 
+  async initPgPubSub() {
+    if (!Database.isPostgresDialect?.() || !process.env.DATABASE_URL) return
+
+    try {
+      await Database.sequelize.query(`
+        CREATE UNLOGGED TABLE IF NOT EXISTS abs_broadcast_events (
+          id BIGSERIAL PRIMARY KEY,
+          origin VARCHAR(64) NOT NULL,
+          payload JSONB NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_abs_broadcast_events_created ON abs_broadcast_events (created_at);
+      `)
+
+      this.pgCleanupInterval = setInterval(async () => {
+        try {
+          if (!this.isClosing && Database.sequelize) {
+            await Database.sequelize.query("DELETE FROM abs_broadcast_events WHERE created_at < NOW() - INTERVAL '5 minutes';")
+          }
+        } catch (err) {
+          Logger.error('[SocketAuthority] Failed to clean up broadcast events table', err)
+        }
+      }, 5 * 60 * 1000)
+      if (this.pgCleanupInterval.unref) this.pgCleanupInterval.unref()
+
+      await this.connectPgSubscriber()
+    } catch (err) {
+      Logger.error('[SocketAuthority] Failed to initialize PostgreSQL Pub/Sub', err)
+    }
+  }
+
+  async connectPgSubscriber() {
+    if (this.isClosing) return
+    try {
+      const { Client } = require('pg')
+      this.pgSubscriber = new Client({ connectionString: process.env.DATABASE_URL })
+      await this.pgSubscriber.connect()
+      await this.pgSubscriber.query('LISTEN abs_socket_events;')
+      Logger.info(`[SocketAuthority] PostgreSQL Pub/Sub listener active (instance ${this.instanceId})`)
+
+      this.pgSubscriber.on('notification', async (msg) => {
+        try {
+          if (!msg.payload) return
+          let eventData = JSON.parse(msg.payload)
+          if (eventData.id) {
+            const [rows] = await Database.sequelize.query(`SELECT payload FROM abs_broadcast_events WHERE id = :id;`, {
+              replacements: { id: eventData.id }
+            })
+            if (rows && rows[0]?.payload) {
+              eventData = rows[0].payload
+            } else {
+              return
+            }
+          }
+          if (eventData.origin === this.instanceId) return
+          this._dispatchLocally(eventData)
+        } catch (err) {
+          Logger.error('[SocketAuthority] Error processing pub/sub notification', err)
+        }
+      })
+
+      this.pgSubscriber.on('error', (err) => {
+        Logger.error('[SocketAuthority] PostgreSQL Pub/Sub connection error', err)
+        this.reconnectPgSubscriber()
+      })
+
+      this.pgSubscriber.on('end', () => {
+        if (!this.isClosing) {
+          this.reconnectPgSubscriber()
+        }
+      })
+    } catch (err) {
+      Logger.error('[SocketAuthority] Error connecting pg subscriber', err)
+      this.reconnectPgSubscriber()
+    }
+  }
+
+  reconnectPgSubscriber() {
+    if (this.isClosing || this._reconnecting) return
+    this._reconnecting = true
+    if (this.pgSubscriber) {
+      try {
+        this.pgSubscriber.end().catch(() => {})
+      } catch (e) {}
+      this.pgSubscriber = null
+    }
+    setTimeout(async () => {
+      this._reconnecting = false
+      await this.connectPgSubscriber()
+    }, 5000)
+  }
+
   initialize(Server) {
     this.Server = Server
+    this.initPgPubSub()
 
     const socketIoOptions = {
       cors: {

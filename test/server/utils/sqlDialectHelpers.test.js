@@ -65,4 +65,42 @@ describe('sqlDialectHelpers', () => {
     expect(safeTextToIntegerExpression('publishedYear', sqlite)).to.equal('CAST(publishedYear AS INTEGER)')
     expect(safeTextToIntegerExpression('book.publishedYear', postgres)).to.equal("CASE WHEN BTRIM(book.publishedYear) ~ '^[+-]?\\d+$' THEN BTRIM(book.publishedYear)::integer ELSE NULL END")
   })
+
+  it('should hash strings consistently to positive integers', () => {
+    const { hashStringToInt } = require('../../../server/utils/sqlDialectHelpers')
+    const hash1 = hashStringToInt('scan_library_123')
+    const hash2 = hashStringToInt('scan_library_123')
+    const hash3 = hashStringToInt('scan_library_456')
+
+    expect(hash1).to.equal(hash2)
+    expect(hash1).to.not.equal(hash3)
+    expect(hash1).to.be.a('number')
+    expect(hash1).to.be.at.least(0)
+  })
+
+  it('should handle advisory locks on sqlite as no-op true', async () => {
+    const { tryAdvisoryLock, releaseAdvisoryLock } = require('../../../server/utils/sqlDialectHelpers')
+    const acquired = await tryAdvisoryLock(sqlite, 'test_lock')
+    expect(acquired).to.be.true
+    const released = await releaseAdvisoryLock(sqlite, 'test_lock')
+    expect(released).to.be.true
+  })
+
+  it('should query pg_try_advisory_lock on postgres', async () => {
+    const { tryAdvisoryLock, releaseAdvisoryLock } = require('../../../server/utils/sqlDialectHelpers')
+    const mockPostgres = {
+      getDialect: () => 'postgres',
+      query: async (sql) => {
+        if (sql.includes('pg_try_advisory_lock')) {
+          return [[{ acquired: true }]]
+        }
+        return [[{ pg_advisory_unlock: true }]]
+      }
+    }
+    const acquired = await tryAdvisoryLock(mockPostgres, 'test_lock')
+    expect(acquired).to.be.true
+    const released = await releaseAdvisoryLock(mockPostgres, 'test_lock')
+    expect(released).to.be.true
+  })
 })
+

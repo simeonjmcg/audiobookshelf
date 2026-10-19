@@ -14,7 +14,7 @@ const LibraryItemScanner = require('./LibraryItemScanner')
 const LibraryScan = require('./LibraryScan')
 const LibraryItemScanData = require('./LibraryItemScanData')
 const Task = require('../objects/Task')
-const { isPostgres, jsonArrayExpand } = require('../utils/sqlDialectHelpers')
+const { isPostgres, jsonArrayExpand, tryAdvisoryLock, releaseAdvisoryLock } = require('../utils/sqlDialectHelpers')
 const StorageManager = require('../storage/StorageManager')
 const prober = require('../utils/prober')
 const { pLimit } = require('../utils/asyncUtils')
@@ -60,6 +60,13 @@ class LibraryScanner {
 
     if (!library.libraryFolders.length) {
       Logger.warn(`[LibraryScanner] Library has no folders to scan "${library.name}"`)
+      return
+    }
+
+    const lockKey = `scan_library_${library.id}`
+    const acquired = await tryAdvisoryLock(Database.sequelize, lockKey)
+    if (!acquired) {
+      Logger.warn(`[LibraryScanner] Library ${library.id} ("${library.name}") is currently being scanned by another instance`)
       return
     }
 
@@ -132,6 +139,7 @@ class LibraryScanner {
 
     if (this.cancelLibraryScan[libraryScan.libraryId]) delete this.cancelLibraryScan[libraryScan.libraryId]
     this.librariesScanning = this.librariesScanning.filter((lid) => lid !== library.id)
+    await releaseAdvisoryLock(Database.sequelize, lockKey)
 
     TaskManager.taskFinished(task)
 

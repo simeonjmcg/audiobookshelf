@@ -75,6 +75,33 @@ function safeTextToIntegerExpression(columnExpression, sequelize) {
   return `CAST(${columnExpression} AS INTEGER)`
 }
 
+function hashStringToInt(str) {
+  let hash = 0
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash) + str.charCodeAt(i)
+    hash |= 0
+  }
+  return Math.abs(hash)
+}
+
+async function tryAdvisoryLock(sequelize, lockKey) {
+  if (!isPostgres(sequelize)) return true
+  const lockId = typeof lockKey === 'number' ? lockKey : hashStringToInt(String(lockKey))
+  const [results] = await sequelize.query(`SELECT pg_try_advisory_lock(${lockId}) AS acquired;`)
+  return !!(results[0]?.acquired || results[0]?.pg_try_advisory_lock)
+}
+
+async function releaseAdvisoryLock(sequelize, lockKey) {
+  if (!isPostgres(sequelize)) return true
+  const lockId = typeof lockKey === 'number' ? lockKey : hashStringToInt(String(lockKey))
+  try {
+    await sequelize.query(`SELECT pg_advisory_unlock(${lockId});`)
+    return true
+  } catch (err) {
+    return false
+  }
+}
+
 module.exports = {
   getDialect,
   isPostgres,
@@ -87,5 +114,9 @@ module.exports = {
   jsonPathText,
   jsonPathNumber,
   safeTextToDoubleExpression,
-  safeTextToIntegerExpression
+  safeTextToIntegerExpression,
+  hashStringToInt,
+  tryAdvisoryLock,
+  releaseAdvisoryLock
 }
+

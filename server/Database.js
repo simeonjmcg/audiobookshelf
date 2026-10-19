@@ -229,13 +229,28 @@ class Database {
       this.isNew = !(await this.checkHasTables())
     }
 
+    let hasLock = false
     try {
+      if (this.isPostgresDialect()) {
+        Logger.info('[Database] Acquiring migration advisory lock...')
+        await this.sequelize.query('SELECT pg_advisory_lock(847291);')
+        hasLock = true
+      }
       const migrationManager = new MigrationManager(this.sequelize, this.isNew, global.ConfigPath)
       await migrationManager.init(packageJson.version)
       await migrationManager.runMigrations()
     } catch (error) {
       Logger.error(`[Database] Failed to run migrations`, error)
       throw new Error('Database migration failed')
+    } finally {
+      if (hasLock) {
+        try {
+          await this.sequelize.query('SELECT pg_advisory_unlock(847291);')
+          Logger.info('[Database] Released migration advisory lock')
+        } catch (err) {
+          Logger.error('[Database] Error releasing migration advisory lock', err)
+        }
+      }
     }
 
     await this.buildModels(force)

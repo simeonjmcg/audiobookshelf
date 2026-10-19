@@ -5,6 +5,7 @@ const Database = require('../Database')
 const LibraryScanner = require('../scanner/LibraryScanner')
 
 const ShareManager = require('./ShareManager')
+const { tryAdvisoryLock, releaseAdvisoryLock } = require('../utils/sqlDialectHelpers')
 
 class CronManager {
   constructor(podcastManager, playbackSessionManager) {
@@ -41,11 +42,21 @@ class CronManager {
    */
   initOpenSessionCleanupCron() {
     cron.schedule('30 0 * * *', async () => {
-      Logger.debug('[CronManager] Open session cleanup cron executing')
-      ShareManager.closeStaleOpenShareSessions()
-      await this.playbackSessionManager.closeStaleOpenSessions()
-      await Database.cleanupExpiredSessions()
-      await Database.deactivateExpiredApiKeys()
+      const lockKey = 'cron_open_session_cleanup'
+      const acquired = await tryAdvisoryLock(Database.sequelize, lockKey)
+      if (!acquired) {
+        Logger.debug('[CronManager] Open session cleanup already running on another instance')
+        return
+      }
+      try {
+        Logger.debug('[CronManager] Open session cleanup cron executing')
+        ShareManager.closeStaleOpenShareSessions()
+        await this.playbackSessionManager.closeStaleOpenSessions()
+        await Database.cleanupExpiredSessions()
+        await Database.deactivateExpiredApiKeys()
+      } finally {
+        await releaseAdvisoryLock(Database.sequelize, lockKey)
+      }
     })
   }
 
@@ -182,40 +193,52 @@ class CronManager {
       Logger.error(`[CronManager] Podcast cron not found for expression ${expression}`)
       return
     }
-    this.podcastCronExpressionsExecuting.push(expression)
 
-    const libraryItemIds = podcastCron.libraryItemIds
-    Logger.debug(`[CronManager] Start executing podcast cron ${expression} for ${libraryItemIds.length} item(s)`)
-
-    // Get podcast library items to check
-    const libraryItems = []
-    for (const libraryItemId of libraryItemIds) {
-      const libraryItem = await Database.libraryItemModel.getExpandedById(libraryItemId)
-      if (!libraryItem) {
-        Logger.error(`[CronManager] Library item ${libraryItemId} not found for episode check cron ${expression}`)
-        podcastCron.libraryItemIds = podcastCron.libraryItemIds.filter((lid) => lid !== libraryItemId) // Filter it out
-      } else {
-        libraryItems.push(libraryItem)
-      }
-    }
-
-    // Run episode checks
-    for (const libraryItem of libraryItems) {
-      const keepAutoDownloading = await this.podcastManager.runEpisodeCheck(libraryItem)
-      if (!keepAutoDownloading) {
-        // auto download was disabled
-        podcastCron.libraryItemIds = podcastCron.libraryItemIds.filter((lid) => lid !== libraryItem.id) // Filter it out
-      }
-    }
-
-    // Stop and remove cron if no more library items
-    if (!podcastCron.libraryItemIds.length) {
-      this.removePodcastEpisodeCron(podcastCron)
+    const lockKey = `cron_podcast_${expression}`
+    const acquired = await tryAdvisoryLock(Database.sequelize, lockKey)
+    if (!acquired) {
+      Logger.debug(`[CronManager] Podcast cron "${expression}" is running on another instance`)
       return
     }
 
-    Logger.debug(`[CronManager] Finished executing podcast cron ${expression} for ${libraryItems.length} item(s)`)
-    this.podcastCronExpressionsExecuting = this.podcastCronExpressionsExecuting.filter((exp) => exp !== expression)
+    this.podcastCronExpressionsExecuting.push(expression)
+
+    try {
+      const libraryItemIds = podcastCron.libraryItemIds
+      Logger.debug(`[CronManager] Start executing podcast cron ${expression} for ${libraryItemIds.length} item(s)`)
+
+      // Get podcast library items to check
+      const libraryItems = []
+      for (const libraryItemId of libraryItemIds) {
+        const libraryItem = await Database.libraryItemModel.getExpandedById(libraryItemId)
+        if (!libraryItem) {
+          Logger.error(`[CronManager] Library item ${libraryItemId} not found for episode check cron ${expression}`)
+          podcastCron.libraryItemIds = podcastCron.libraryItemIds.filter((lid) => lid !== libraryItemId) // Filter it out
+        } else {
+          libraryItems.push(libraryItem)
+        }
+      }
+
+      // Run episode checks
+      for (const libraryItem of libraryItems) {
+        const keepAutoDownloading = await this.podcastManager.runEpisodeCheck(libraryItem)
+        if (!keepAutoDownloading) {
+          // auto download was disabled
+          podcastCron.libraryItemIds = podcastCron.libraryItemIds.filter((lid) => lid !== libraryItem.id) // Filter it out
+        }
+      }
+
+      // Stop and remove cron if no more library items
+      if (!podcastCron.libraryItemIds.length) {
+        this.removePodcastEpisodeCron(podcastCron)
+        return
+      }
+
+      Logger.debug(`[CronManager] Finished executing podcast cron ${expression} for ${libraryItems.length} item(s)`)
+    } finally {
+      this.podcastCronExpressionsExecuting = this.podcastCronExpressionsExecuting.filter((exp) => exp !== expression)
+      await releaseAdvisoryLock(Database.sequelize, lockKey)
+    }
   }
 
   removePodcastEpisodeCron(podcastCron) {
