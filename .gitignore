@@ -27,3 +27,4 @@ tailwind.compiled.css
 tailwind.config.js
 gcp-key.json
 *.key.json
+/audiobookshelf-gcloud-chart/

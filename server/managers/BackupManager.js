@@ -452,64 +452,79 @@ class BackupManager {
   }
 
   async runBackup() {
-    // Check if Metadata Path is inside Config Path (otherwise there will be an infinite loop as the archiver tries to zip itself)
-    Logger.info(`[BackupManager] Running Backup`)
-    const databaseBackupConfig = this.databaseBackupConfig
-    const newBackup = new Backup()
-    newBackup.setData(this.backupPath, databaseBackupConfig.dialect)
-
-    await fs.ensureDir(this.AuthorsMetadataPath)
-
-    // Create a database dump
-    const databaseBackupPath = await this.backupDatabase(newBackup).catch((error) => {
-      Logger.error(`[BackupManager] Failed to backup ${databaseBackupConfig.dialect} database`, error)
-      const errorMsg = error?.message || error || 'Unknown Error'
-      NotificationManager.onBackupFailed(errorMsg)
-      return false
-    })
-
-    if (!databaseBackupPath) {
+    const { tryAdvisoryLock, releaseAdvisoryLock } = require('../utils/sqlDialectHelpers')
+    const lockKey = 'job_backup'
+    const acquired = await tryAdvisoryLock(Database.sequelize, lockKey)
+    if (!acquired) {
+      Logger.debug('[BackupManager] Backup is already running on another instance')
       return false
     }
 
-    // Zip database dump, /metadata/items, and /metadata/authors folders
-    const zipResult = await this.zipBackup(databaseBackupPath, newBackup, databaseBackupConfig.entryName).catch((error) => {
-      Logger.error(`[BackupManager] Backup Failed ${error}`)
-      const errorMsg = error?.message || error || 'Unknown Error'
-      NotificationManager.onBackupFailed(errorMsg)
-      return false
-    })
+    try {
+      // Check if Metadata Path is inside Config Path (otherwise there will be an infinite loop as the archiver tries to zip itself)
+      Logger.info(`[BackupManager] Running Backup`)
+      const databaseBackupConfig = this.databaseBackupConfig
+      const newBackup = new Backup()
+      newBackup.setData(this.backupPath, databaseBackupConfig.dialect)
 
-    // Remove temporary database dump
-    await fs.remove(databaseBackupPath)
+      await fs.ensureDir(this.AuthorsMetadataPath)
 
-    if (!zipResult) return false
+      // Create a database dump
+      const databaseBackupPath = await this.backupDatabase(newBackup).catch((error) => {
+        Logger.error(`[BackupManager] Failed to backup ${databaseBackupConfig.dialect} database`, error)
+        const errorMsg = error?.message || error || 'Unknown Error'
+        NotificationManager.onBackupFailed(errorMsg)
+        return false
+      })
 
-    Logger.info(`[BackupManager] Backup successful ${newBackup.id}`)
+      if (!databaseBackupPath) {
+        return false
+      }
 
-    newBackup.fileSize = await getFileSize(newBackup.fullPath)
+      // Zip database dump, /metadata/items, and /metadata/authors folders
+      const zipResult = await this.zipBackup(databaseBackupPath, newBackup, databaseBackupConfig.entryName).catch((error) => {
+        Logger.error(`[BackupManager] Backup Failed ${error}`)
+        const errorMsg = error?.message || error || 'Unknown Error'
+        NotificationManager.onBackupFailed(errorMsg)
+        return false
+      })
 
-    const existingIndex = this.backups.findIndex((b) => b.id === newBackup.id)
-    if (existingIndex >= 0) {
-      this.backups.splice(existingIndex, 1, newBackup)
-    } else {
-      this.backups.push(newBackup)
+      // Remove temporary database dump
+      await fs.remove(databaseBackupPath)
+
+      if (!zipResult) return false
+
+      Logger.info(`[BackupManager] Backup successful ${newBackup.id}`)
+
+      newBackup.fileSize = await getFileSize(newBackup.fullPath)
+
+      const StorageManager = require('../storage/StorageManager')
+      await StorageManager.saveMetadataFile(newBackup.fullPath)
+
+      const existingIndex = this.backups.findIndex((b) => b.id === newBackup.id)
+      if (existingIndex >= 0) {
+        this.backups.splice(existingIndex, 1, newBackup)
+      } else {
+        this.backups.push(newBackup)
+      }
+
+      // Check remove oldest backup
+      const removeOldest = this.backups.length > this.backupsToKeep
+      if (removeOldest) {
+        this.backups.sort((a, b) => a.createdAt - b.createdAt)
+
+        const oldBackup = this.backups.shift()
+        Logger.debug(`[BackupManager] Removing old backup ${oldBackup.id}`)
+        await this.removeBackup(oldBackup)
+      }
+
+      // Notification for backup successfully completed
+      NotificationManager.onBackupCompleted(newBackup, this.backups.length, removeOldest)
+
+      return true
+    } finally {
+      await releaseAdvisoryLock(Database.sequelize, lockKey)
     }
-
-    // Check remove oldest backup
-    const removeOldest = this.backups.length > this.backupsToKeep
-    if (removeOldest) {
-      this.backups.sort((a, b) => a.createdAt - b.createdAt)
-
-      const oldBackup = this.backups.shift()
-      Logger.debug(`[BackupManager] Removing old backup ${oldBackup.id}`)
-      this.removeBackup(oldBackup)
-    }
-
-    // Notification for backup successfully completed
-    NotificationManager.onBackupCompleted(newBackup, this.backups.length, removeOldest)
-
-    return true
   }
 
   backupDatabase(backup) {
@@ -519,6 +534,8 @@ class BackupManager {
   async removeBackup(backup) {
     try {
       Logger.debug(`[BackupManager] Removing Backup "${backup.fullPath}"`)
+      const StorageManager = require('../storage/StorageManager')
+      await StorageManager.removeMetadataFile(backup.fullPath)
       await fs.remove(backup.fullPath)
       this.backups = this.backups.filter((b) => b.id !== backup.id)
       Logger.info(`[BackupManager] Backup "${backup.id}" Removed`)

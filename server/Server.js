@@ -124,6 +124,13 @@ class Server {
     if (!fs.pathExistsSync(global.MetadataPath)) {
       fs.mkdirSync(global.MetadataPath)
     }
+    const metadataSubdirs = ['authors', 'items', 'cache', 'backups', 'tmp', 'streams']
+    for (const subdir of metadataSubdirs) {
+      const p = Path.join(global.MetadataPath, subdir)
+      if (!fs.pathExistsSync(p)) {
+        fs.mkdirSync(p, { recursive: true })
+      }
+    }
 
     this.auth = new Auth()
 

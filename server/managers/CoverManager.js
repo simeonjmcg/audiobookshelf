@@ -36,6 +36,13 @@ class CoverManager {
   async getLocalCoverPath(libraryItemId, coverPath) {
     if (!coverPath) return null
     const StorageManager = require('../storage/StorageManager')
+
+    // Check if cover can be resolved or downloaded via StorageManager metadata resolver
+    const localMetadataPath = await StorageManager.ensureLocalMetadata(coverPath)
+    if (localMetadataPath) {
+      return localMetadataPath
+    }
+
     if (!StorageManager.isGcsPath(coverPath)) {
       return (await fs.pathExists(coverPath)) ? coverPath : null
     }
@@ -383,6 +390,8 @@ class CoverManager {
             Logger.error(`[CoverManager] Failed to copy cover to "${finalCoverPath}": ${err.message}`)
           })
         }
+      } else {
+        await StorageManager.saveMetadataFile(localCoverPath)
       }
 
       await CacheManager.purgeCoverCache(libraryItemId)
@@ -435,6 +444,7 @@ class CoverManager {
       await fs.rename(temppath, coverFullPath)
 
       await this.removeOldCovers(coverDirPath, '.' + imgtype.ext)
+      await StorageManager.saveMetadataFile(coverFullPath)
       await CacheManager.purgeCoverCache(libraryItemId)
 
       Logger.info(`[CoverManager] Downloaded libraryItem cover "${coverFullPath}" from url "${url}"`)

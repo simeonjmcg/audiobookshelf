@@ -161,5 +161,80 @@ describe('StorageManager & Providers', () => {
       expect(res.ino).to.equal('987654321')
     })
   })
+
+  describe('StorageManager GCS metadata handling', () => {
+    const fs = require('../../../server/libs/fsExtra')
+
+    beforeEach(() => {
+      global.MetadataPath = '/metadata'
+      StorageManager.gcsProvider = gcsProvider
+    })
+
+    it('should resolve metadata paths correctly', () => {
+      const res1 = StorageManager.resolveMetadataPaths('/metadata/authors/author-1.jpg')
+      expect(res1).to.deep.equal({
+        key: 'metadata/authors/author-1.jpg',
+        gcsUri: 'gcs://smcgraw-abs-lib/metadata/authors/author-1.jpg',
+        localPath: '/metadata/authors/author-1.jpg'
+      })
+
+      const res2 = StorageManager.resolveMetadataPaths('gcs://smcgraw-abs-lib/metadata/items/item-1/cover.jpg')
+      expect(res2).to.deep.equal({
+        key: 'metadata/items/item-1/cover.jpg',
+        gcsUri: 'gcs://smcgraw-abs-lib/metadata/items/item-1/cover.jpg',
+        localPath: '/metadata/items/item-1/cover.jpg'
+      })
+    })
+
+    it('should download missing metadata file from GCS on-demand', async () => {
+      sinon.stub(fs, 'pathExists').resolves(false)
+      sinon.stub(fs, 'ensureDir').resolves()
+
+      const mockFile = {
+        exists: sinon.stub().resolves([true]),
+        download: sinon.stub().resolves()
+      }
+      sinon.stub(gcsProvider, 'getBucket').returns({
+        file: sinon.stub().returns(mockFile)
+      })
+
+      const result = await StorageManager.ensureLocalMetadata('/metadata/authors/148fcdfd.jpg')
+      expect(result).to.equal('/metadata/authors/148fcdfd.jpg')
+      expect(mockFile.download.calledOnce).to.be.true
+      expect(mockFile.download.firstCall.args[0]).to.deep.equal({ destination: '/metadata/authors/148fcdfd.jpg' })
+    })
+
+    it('should upload local metadata file to GCS', async () => {
+      sinon.stub(fs, 'pathExists').resolves(true)
+      sinon.stub(fs, 'readFile').resolves(Buffer.from('fake image content'))
+
+      const mockFile = {
+        save: sinon.stub().resolves()
+      }
+      sinon.stub(gcsProvider, 'getBucket').returns({
+        file: sinon.stub().returns(mockFile)
+      })
+
+      await StorageManager.saveMetadataFile('/metadata/authors/new-author.jpg')
+      expect(mockFile.save.calledOnce).to.be.true
+      expect(mockFile.save.firstCall.args[1]).to.deep.equal({ resumable: false })
+    })
+
+    it('should remove metadata file from GCS and local', async () => {
+      sinon.stub(fs, 'pathExists').resolves(true)
+      sinon.stub(fs, 'unlink').resolves()
+
+      const mockFile = {
+        delete: sinon.stub().resolves()
+      }
+      sinon.stub(gcsProvider, 'getBucket').returns({
+        file: sinon.stub().returns(mockFile)
+      })
+
+      await StorageManager.removeMetadataFile('/metadata/authors/remove-author.jpg')
+      expect(mockFile.delete.calledOnce).to.be.true
+      expect(fs.unlink.calledOnce).to.be.true
+    })
+  })
 })
 

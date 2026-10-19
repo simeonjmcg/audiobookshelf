@@ -52,7 +52,9 @@ class AuthorFinder {
     const filename = authorId + '.' + ext
     const outputPath = Path.posix.join(authorDir, filename)
 
-    return downloadImageFile(url, outputPath).then(() => {
+    return downloadImageFile(url, outputPath).then(async () => {
+      const StorageManager = require('../storage/StorageManager')
+      await StorageManager.saveMetadataFile(outputPath)
       return {
         path: outputPath
       }

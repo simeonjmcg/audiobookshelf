@@ -180,11 +180,17 @@ class CacheManager {
     }
 
     const author = await Database.authorModel.findByPk(authorId)
-    if (!author || !author.imagePath || !(await fs.pathExists(author.imagePath))) {
+    if (!author || !author.imagePath) {
       return res.sendStatus(404)
     }
 
-    let writtenFile = await resizeImage(author.imagePath, cachePath, width, height)
+    const StorageManager = require('../storage/StorageManager')
+    const localImagePath = await StorageManager.ensureLocalMetadata(author.imagePath)
+    if (!localImagePath) {
+      return res.sendStatus(404)
+    }
+
+    let writtenFile = await resizeImage(localImagePath, cachePath, width, height)
     if (!writtenFile) return res.sendStatus(500)
 
     var readStream = fs.createReadStream(writtenFile)

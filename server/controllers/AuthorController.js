@@ -317,6 +317,8 @@ class AuthorController {
     }
     Logger.info(`[AuthorController] Removing image for author "${req.author.name}" at "${req.author.imagePath}"`)
     await CacheManager.purgeImageCache(req.author.id) // Purge cache
+    const StorageManager = require('../storage/StorageManager')
+    await StorageManager.removeMetadataFile(req.author.imagePath)
     await CoverManager.removeFile(req.author.imagePath)
     req.author.imagePath = null
     await req.author.save()
@@ -402,12 +404,19 @@ class AuthorController {
         return res.sendStatus(404)
       }
 
-      if (!author.imagePath || !(await fs.pathExists(author.imagePath))) {
+      if (!author.imagePath) {
+        Logger.warn(`[AuthorController] Author "${author.name}" has no imagePath`)
+        return res.sendStatus(404)
+      }
+
+      const StorageManager = require('../storage/StorageManager')
+      const localImagePath = await StorageManager.ensureLocalMetadata(author.imagePath)
+      if (!localImagePath) {
         Logger.warn(`[AuthorController] Author "${author.name}" has invalid imagePath: ${author.imagePath}`)
         return res.sendStatus(404)
       }
 
-      return res.sendFile(author.imagePath)
+      return res.sendFile(localImagePath)
     }
 
     const options = {
