@@ -26,6 +26,30 @@ class PlaybackSessionManager {
     this.sessions = []
     this.instanceId = uuidv4()
     this.activeSessionsCleanupInterval = null
+    this._podAddress = null
+  }
+
+  get podAddress() {
+    if (this._podAddress) return this._podAddress
+    const port = process.env.PORT || 80
+    if (process.env.POD_IP) {
+      this._podAddress = `${process.env.POD_IP}:${port}`
+      return this._podAddress
+    }
+    try {
+      const os = require('os')
+      const ifaces = os.networkInterfaces()
+      for (const name of Object.keys(ifaces)) {
+        for (const iface of ifaces[name]) {
+          if (!iface.internal && iface.family === 'IPv4') {
+            this._podAddress = `${iface.address}:${port}`
+            return this._podAddress
+          }
+        }
+      }
+    } catch (e) {}
+    this._podAddress = `127.0.0.1:${port}`
+    return this._podAddress
   }
 
   async initClusterActiveSessions() {
@@ -38,8 +62,10 @@ class PlaybackSessionManager {
           instance_id VARCHAR(64) NOT NULL,
           user_id VARCHAR(64) NOT NULL,
           session_json JSONB NOT NULL,
+          pod_address VARCHAR(128),
           updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
+        ALTER TABLE abs_active_sessions ADD COLUMN IF NOT EXISTS pod_address VARCHAR(128);
         CREATE INDEX IF NOT EXISTS idx_abs_active_sessions_inst ON abs_active_sessions (instance_id);
         CREATE INDEX IF NOT EXISTS idx_abs_active_sessions_user ON abs_active_sessions (user_id);
         CREATE INDEX IF NOT EXISTS idx_abs_active_sessions_updated ON abs_active_sessions (updated_at);
@@ -69,24 +95,42 @@ class PlaybackSessionManager {
     try {
       const sessionJson = JSON.stringify(session.toJSON())
       await Database.sequelize.query(
-        `INSERT INTO abs_active_sessions (session_id, instance_id, user_id, session_json, updated_at)
-         VALUES (:sessionId, :instanceId, :userId, :sessionJson, NOW())
+        `INSERT INTO abs_active_sessions (session_id, instance_id, user_id, session_json, pod_address, updated_at)
+         VALUES (:sessionId, :instanceId, :userId, :sessionJson, :podAddress, NOW())
          ON CONFLICT (session_id) DO UPDATE SET
            instance_id = EXCLUDED.instance_id,
            user_id = EXCLUDED.user_id,
            session_json = EXCLUDED.session_json,
+           pod_address = EXCLUDED.pod_address,
            updated_at = NOW();`,
         {
           replacements: {
             sessionId: session.id,
             instanceId: this.instanceId,
             userId: session.userId,
-            sessionJson
+            sessionJson,
+            podAddress: this.podAddress
           }
         }
       )
     } catch (err) {
       Logger.error(`[PlaybackSessionManager] Failed to record active session "${session.id}"`, err)
+    }
+  }
+
+  async getActiveSessionPodAddress(sessionId) {
+    if (!Database.isPostgresDialect?.() || !Database.sequelize || !sessionId) return null
+    try {
+      const [rows] = await Database.sequelize.query(
+        `SELECT pod_address FROM abs_active_sessions WHERE session_id = :sessionId AND updated_at > NOW() - INTERVAL '5 minutes';`,
+        {
+          replacements: { sessionId }
+        }
+      )
+      return rows?.[0]?.pod_address || null
+    } catch (err) {
+      Logger.error(`[PlaybackSessionManager] Failed to query pod_address for session "${sessionId}"`, err)
+      return null
     }
   }
 

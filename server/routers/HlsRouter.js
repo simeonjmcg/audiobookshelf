@@ -1,5 +1,6 @@
 const express = require('express')
 const Path = require('path')
+const http = require('http')
 
 const Logger = require('../Logger')
 const SocketAuthority = require('../SocketAuthority')
@@ -19,6 +20,36 @@ class HlsRouter {
 
   init() {
     this.router.get('/:stream/:file', this.streamFileRequest.bind(this))
+  }
+
+  proxyStreamRequest(targetPodAddress, req, res) {
+    const [host, port] = targetPodAddress.split(':')
+    const options = {
+      hostname: host,
+      port: port ? parseInt(port, 10) : 80,
+      path: req.originalUrl,
+      method: req.method,
+      headers: {
+        ...req.headers,
+        host: targetPodAddress,
+        'x-forwarded-for': req.headers['x-forwarded-for'] || req.socket.remoteAddress
+      }
+    }
+
+    Logger.debug(`[HlsRouter] Proxying HLS stream request "${req.originalUrl}" to peer pod at ${targetPodAddress}`)
+    const proxyReq = http.request(options, (proxyRes) => {
+      res.writeHead(proxyRes.statusCode, proxyRes.headers)
+      proxyRes.pipe(res)
+    })
+
+    proxyReq.on('error', (err) => {
+      Logger.error(`[HlsRouter] Failed to proxy HLS stream request to peer pod at ${targetPodAddress}:`, err.message)
+      if (!res.headersSent) {
+        res.sendStatus(502)
+      }
+    })
+
+    req.pipe(proxyReq)
   }
 
   parseSegmentFilename(filename) {
@@ -53,6 +84,13 @@ class HlsRouter {
     // Ensure stream is open
     const stream = this.playbackSessionManager.getStream(streamId)
     if (!stream) {
+      if (typeof this.playbackSessionManager.getActiveSessionPodAddress === 'function') {
+        const peerPodAddress = await this.playbackSessionManager.getActiveSessionPodAddress(streamId)
+        if (peerPodAddress && peerPodAddress !== this.playbackSessionManager.podAddress) {
+          return this.proxyStreamRequest(peerPodAddress, req, res)
+        }
+      }
+
       Logger.error(`[HlsRouter] Stream "${streamId}" does not exist`)
       return res.sendStatus(404)
     }

@@ -283,4 +283,58 @@ describe('PlaybackSessionManager Multi-Replica State Centralization', () => {
       expect(playbackSessionManager.getOrLoadSession.calledWith('sess-track-1')).to.be.true
     })
   })
+
+  describe('HlsRouter cross-pod peer proxying', () => {
+    let HlsRouterClass
+    let hlsRouter
+
+    before(() => {
+      HlsRouterClass = require('../../../server/routers/HlsRouter')
+    })
+
+    beforeEach(() => {
+      hlsRouter = new HlsRouterClass({}, playbackSessionManager)
+    })
+
+    it('should query getActiveSessionPodAddress when stream is not in local memory', async () => {
+      sinon.stub(playbackSessionManager, 'getStream').returns(null)
+      sinon.stub(playbackSessionManager, 'getActiveSessionPodAddress').withArgs('stream-remote-1').resolves('10.42.5.6:80')
+      sinon.stub(playbackSessionManager, 'podAddress').get(() => '10.42.1.2:80')
+
+      const proxyStub = sinon.stub(hlsRouter, 'proxyStreamRequest').resolves()
+
+      const req = {
+        params: { stream: 'stream-remote-1', file: 'output-1.ts' },
+        originalUrl: '/hls/stream-remote-1/output-1.ts',
+        method: 'GET',
+        headers: {}
+      }
+      const res = {
+        sendStatus: sinon.spy()
+      }
+
+      await hlsRouter.streamFileRequest(req, res)
+
+      expect(playbackSessionManager.getActiveSessionPodAddress.calledWith('stream-remote-1')).to.be.true
+      expect(proxyStub.calledOnce).to.be.true
+      expect(proxyStub.firstCall.args[0]).to.equal('10.42.5.6:80')
+      expect(res.sendStatus.called).to.be.false
+    })
+
+    it('should return 404 when stream is not found locally and not found on any peer pod', async () => {
+      sinon.stub(playbackSessionManager, 'getStream').returns(null)
+      sinon.stub(playbackSessionManager, 'getActiveSessionPodAddress').resolves(null)
+
+      const req = {
+        params: { stream: 'missing-stream', file: 'output-1.ts' }
+      }
+      const res = {
+        sendStatus: sinon.spy()
+      }
+
+      await hlsRouter.streamFileRequest(req, res)
+
+      expect(res.sendStatus.calledWith(404)).to.be.true
+    })
+  })
 })
