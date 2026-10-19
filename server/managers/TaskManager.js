@@ -67,5 +67,20 @@ class TaskManager {
     SocketAuthority.emitter('task_started', task.toJSON())
     return task
   }
+
+  handleRemoteTaskStarted(taskData) {
+    if (!taskData?.id) return
+    if (!this.tasks.some((t) => t.id === taskData.id)) {
+      this.tasks.push({
+        ...taskData,
+        toJSON: () => ({ ...taskData })
+      })
+    }
+  }
+
+  handleRemoteTaskFinished(taskData) {
+    if (!taskData?.id) return
+    this.tasks = this.tasks.filter((t) => t.id !== taskData.id)
+  }
 }
 module.exports = new TaskManager()

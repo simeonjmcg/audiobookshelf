@@ -32,9 +32,31 @@ class SocketAuthority {
   /**
    * returns an array of User.toJSONForPublic with `connections` for the # of socket connections
    *  a user can have many socket connections
-   * @returns {object[]}
+   * @returns {Promise<object[]>|object[]}
    */
-  getUsersOnline() {
+  async getUsersOnline() {
+    if (Database.isPostgresDialect?.() && Database.sequelize) {
+      try {
+        const [rows] = await Database.sequelize.query(
+          `SELECT user_id, user_json, COUNT(*) as connections
+           FROM abs_socket_presences
+           WHERE updated_at > NOW() - INTERVAL '5 minutes'
+           GROUP BY user_id, user_json;`
+        )
+        if (rows && rows.length) {
+          return rows.map((r) => {
+            const data = typeof r.user_json === 'string' ? JSON.parse(r.user_json) : r.user_json
+            return {
+              ...data,
+              connections: parseInt(r.connections, 10) || 1
+            }
+          })
+        }
+      } catch (err) {
+        Logger.error('[SocketAuthority] Failed to query cluster online users', err)
+      }
+    }
+
     const onlineUsersMap = {}
     Object.values(this.clients)
       .filter((c) => c.user)
@@ -43,12 +65,48 @@ class SocketAuthority {
           onlineUsersMap[client.user.id].connections++
         } else {
           onlineUsersMap[client.user.id] = {
-            ...client.user.toJSONForPublic(this.Server.playbackSessionManager.sessions),
+            ...client.user.toJSONForPublic(this.Server?.playbackSessionManager?.sessions),
             connections: 1
           }
         }
       })
     return Object.values(onlineUsersMap)
+  }
+
+  async recordSocketPresence(socketId, user) {
+    if (!Database.isPostgresDialect?.() || !Database.sequelize || this.isClosing) return
+    try {
+      const userJson = JSON.stringify(user.toJSONForPublic(this.Server?.playbackSessionManager?.sessions))
+      await Database.sequelize.query(
+        `INSERT INTO abs_socket_presences (socket_id, instance_id, user_id, user_json, updated_at)
+         VALUES (:socketId, :instanceId, :userId, :userJson, NOW())
+         ON CONFLICT (socket_id) DO UPDATE SET updated_at = NOW(), user_json = :userJson;`,
+        {
+          replacements: {
+            socketId,
+            instanceId: this.instanceId,
+            userId: user.id,
+            userJson
+          }
+        }
+      )
+    } catch (err) {
+      Logger.error('[SocketAuthority] Failed to record socket presence', err)
+    }
+  }
+
+  async removeSocketPresence(socketId) {
+    if (!Database.isPostgresDialect?.() || !Database.sequelize || this.isClosing) return
+    try {
+      await Database.sequelize.query(
+        `DELETE FROM abs_socket_presences WHERE socket_id = :socketId;`,
+        {
+          replacements: { socketId }
+        }
+      )
+    } catch (err) {
+      Logger.error('[SocketAuthority] Failed to remove socket presence', err)
+    }
   }
 
   getClientsForUser(userId) {
@@ -57,12 +115,24 @@ class SocketAuthority {
 
   _dispatchLocally(msg) {
     if (!msg || !msg.type) return
+    if (msg.type === 'cancel_scan') {
+      Logger.debug(`[SocketAuthority] Remote cancel_scan received for library ${msg.libraryId}`)
+      this.Server?.cancelLibraryScan(msg.libraryId)
+      return
+    }
     if (msg.type === 'emitter') {
+      if (msg.evt === 'task_started' && msg.data) {
+        const TaskManager = require('./managers/TaskManager')
+        TaskManager.handleRemoteTaskStarted(msg.data)
+      } else if (msg.evt === 'task_finished' && msg.data) {
+        const TaskManager = require('./managers/TaskManager')
+        TaskManager.handleRemoteTaskFinished(msg.data)
+      }
       const filter = msg.libraryId ? (user) => user.checkCanAccessLibrary?.(msg.libraryId) : null
       for (const socketId in this.clients) {
         if (this.clients[socketId].user) {
           if (filter && !filter(this.clients[socketId].user)) continue
-          this.clients[socketId].socket.emit(msg.evt, msg.data)
+          this.clients[socketId].socket?.emit(msg.evt, msg.data)
         }
       }
     } else if (msg.type === 'clientEmitter') {
@@ -73,13 +143,13 @@ class SocketAuthority {
     } else if (msg.type === 'adminEmitter') {
       for (const socketId in this.clients) {
         if (this.clients[socketId].user?.isAdminOrUp) {
-          this.clients[socketId].socket.emit(msg.evt, msg.data)
+          this.clients[socketId].socket?.emit(msg.evt, msg.data)
         }
       }
     } else if (msg.type === 'libraryItemEmitter') {
       for (const socketId in this.clients) {
         if (this.clients[socketId].user?.checkCanAccessLibraryItem(msg.expanded)) {
-          this.clients[socketId].socket.emit(msg.evt, msg.expanded)
+          this.clients[socketId].socket?.emit(msg.evt, msg.expanded)
         }
       }
     } else if (msg.type === 'libraryItemsEmitter') {
@@ -87,7 +157,7 @@ class SocketAuthority {
         if (this.clients[socketId].user) {
           const libraryItemsAccessibleToUser = (msg.items || []).filter((li) => this.clients[socketId].user.checkCanAccessLibraryItem(li))
           if (libraryItemsAccessibleToUser.length) {
-            this.clients[socketId].socket.emit(msg.evt, libraryItemsAccessibleToUser)
+            this.clients[socketId].socket?.emit(msg.evt, libraryItemsAccessibleToUser)
           }
         }
       }
@@ -133,10 +203,10 @@ class SocketAuthority {
       if (this.clients[socketId].user) {
         if (filter && !filter(this.clients[socketId].user)) continue
 
-        this.clients[socketId].socket.emit(evt, data)
+        this.clients[socketId].socket?.emit(evt, data)
       }
     }
-    const libraryId = evt.startsWith('library_') && data?.id ? data.id : null
+    const libraryId = (evt.startsWith('library_') && data?.id) ? data.id : (data?.libraryId || null)
     this.publishBroadcast({ type: 'emitter', evt, data, libraryId })
   }
 
@@ -159,7 +229,7 @@ class SocketAuthority {
   adminEmitter(evt, data) {
     for (const socketId in this.clients) {
       if (this.clients[socketId].user?.isAdminOrUp) {
-        this.clients[socketId].socket.emit(evt, data)
+        this.clients[socketId].socket?.emit(evt, data)
       }
     }
     this.publishBroadcast({ type: 'adminEmitter', evt, data })
@@ -184,7 +254,7 @@ class SocketAuthority {
     const expanded = typeof libraryItem?.toOldJSONExpanded === 'function' ? libraryItem.toOldJSONExpanded() : libraryItem
     for (const socketId in this.clients) {
       if (this.clients[socketId].user?.checkCanAccessLibraryItem(libraryItem)) {
-        this.clients[socketId].socket.emit(evt, expanded)
+        this.clients[socketId].socket?.emit(evt, expanded)
       }
     }
     this.publishBroadcast({ type: 'libraryItemEmitter', evt, expanded })
@@ -203,7 +273,7 @@ class SocketAuthority {
       if (this.clients[socketId].user) {
         const libraryItemsAccessibleToUser = items.filter((li) => this.clients[socketId].user.checkCanAccessLibraryItem(li))
         if (libraryItemsAccessibleToUser.length) {
-          this.clients[socketId].socket.emit(evt, libraryItemsAccessibleToUser)
+          this.clients[socketId].socket?.emit(evt, libraryItemsAccessibleToUser)
         }
       }
     }
@@ -227,6 +297,13 @@ class SocketAuthority {
         await this.pgSubscriber.end()
       } catch (e) {}
       this.pgSubscriber = null
+    }
+    if (Database.isPostgresDialect?.() && Database.sequelize) {
+      try {
+        await Database.sequelize.query('DELETE FROM abs_socket_presences WHERE instance_id = :instanceId;', {
+          replacements: { instanceId: this.instanceId }
+        })
+      } catch (e) {}
     }
     const closePromises = this.socketIoServers.map((io) => {
       return new Promise((resolve) => {
@@ -254,15 +331,30 @@ class SocketAuthority {
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         CREATE INDEX IF NOT EXISTS idx_abs_broadcast_events_created ON abs_broadcast_events (created_at);
+
+        CREATE UNLOGGED TABLE IF NOT EXISTS abs_socket_presences (
+          socket_id VARCHAR(64) PRIMARY KEY,
+          instance_id VARCHAR(64) NOT NULL,
+          user_id VARCHAR(64) NOT NULL,
+          user_json JSONB NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_abs_socket_presences_inst ON abs_socket_presences (instance_id);
+        CREATE INDEX IF NOT EXISTS idx_abs_socket_presences_user ON abs_socket_presences (user_id);
       `)
+
+      await Database.sequelize.query(`DELETE FROM abs_socket_presences WHERE instance_id = :instanceId;`, {
+        replacements: { instanceId: this.instanceId }
+      })
 
       this.pgCleanupInterval = setInterval(async () => {
         try {
           if (!this.isClosing && Database.sequelize) {
             await Database.sequelize.query("DELETE FROM abs_broadcast_events WHERE created_at < NOW() - INTERVAL '5 minutes';")
+            await Database.sequelize.query("DELETE FROM abs_socket_presences WHERE updated_at < NOW() - INTERVAL '10 minutes';")
           }
         } catch (err) {
-          Logger.error('[SocketAuthority] Failed to clean up broadcast events table', err)
+          Logger.error('[SocketAuthority] Failed to clean up broadcast events and presences tables', err)
         }
       }, 5 * 60 * 1000)
       if (this.pgCleanupInterval.unref) this.pgCleanupInterval.unref()
@@ -413,6 +505,7 @@ class SocketAuthority {
             // Cancel any active cover searches for this socket
             this.cancelSocketCoverSearches(socket.id)
 
+            this.removeSocketPresence(socket.id)
             delete this.clients[socket.id]
           }
         })
@@ -529,6 +622,7 @@ class SocketAuthority {
     }
 
     client.user = user
+    await this.recordSocketPresence(socket.id, user)
     this.adminEmitter('user_online', client.user.toJSONForPublic(this.Server.playbackSessionManager.sessions))
 
     // Update user lastSeen without firing sequelize bulk update hooks
@@ -540,14 +634,15 @@ class SocketAuthority {
       username: client.user.username
     }
     if (user.isAdminOrUp) {
-      initialPayload.usersOnline = this.getUsersOnline()
+      initialPayload.usersOnline = await this.getUsersOnline()
     }
     client.socket.emit('init', initialPayload)
   }
 
   cancelScan(id) {
     Logger.debug('[SocketAuthority] Cancel scan', id)
-    this.Server.cancelLibraryScan(id)
+    this.Server?.cancelLibraryScan(id)
+    this.publishBroadcast({ type: 'cancel_scan', libraryId: id })
   }
 
   /**

@@ -500,7 +500,7 @@ class UserController {
     }
 
     res.json({
-      usersOnline: SocketAuthority.getUsersOnline(),
+      usersOnline: await SocketAuthority.getUsersOnline(),
       openSessions: this.playbackSessionManager.sessions
     })
   }
