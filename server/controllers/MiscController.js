@@ -16,8 +16,6 @@ const { sanitize } = require('../utils/htmlSanitizer')
 
 const TaskManager = require('../managers/TaskManager')
 const adminStats = require('../utils/queries/adminStats')
-const { Server: TusServer } = require('@tus/server')
-const { FileStore: TusFileStore } = require('@tus/file-store')
 const StorageManager = require('../storage/StorageManager')
 
 /**
@@ -66,10 +64,12 @@ class MiscController {
     if (!datastore) {
       uploadDir = Path.join(global.MetadataPath, 'tmp', 'tus')
       fs.ensureDirSync(uploadDir)
+      const { FileStore: TusFileStore } = require('@tus/file-store')
       datastore = new TusFileStore({ directory: uploadDir })
       Logger.info(`[MiscController] Tus server initialized with TusFileStore at "${uploadDir}"`)
     }
 
+    const { Server: TusServer } = require('@tus/server')
     this.tusServer = new TusServer({
       path: '/api/upload/tus',
       datastore,
