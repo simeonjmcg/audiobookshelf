@@ -61,8 +61,8 @@ class FolderWatcher extends EventEmitter {
     Logger.info(`[Watcher] Initializing watcher for "${library.name}".`)
 
     const folderPaths = library.libraryFolders.map((f) => f.path)
-    const localFolderPaths = folderPaths.filter((fp) => !fileUtils.isGcsPath(fp))
-    const gcsFolderPaths = folderPaths.filter((fp) => fileUtils.isGcsPath(fp))
+    const localFolderPaths = folderPaths.filter((fp) => !isGcsPath(fp))
+    const gcsFolderPaths = folderPaths.filter((fp) => isGcsPath(fp))
 
     localFolderPaths.forEach((fp) => {
       Logger.debug(`[Watcher] Init local fs watcher for library folder path "${fp}"`)
@@ -258,7 +258,7 @@ class FolderWatcher extends EventEmitter {
    */
   async waitForFileToAdd(path, lastMTimeMs = 0, loop = 0) {
     // For GCS objects, OBJECT_FINALIZE is only fired when the object upload is already completely finalized
-    if (fileUtils.isGcsPath(path)) {
+    if (isGcsPath(path)) {
       Logger.debug(`[Watcher] GCS file finalized upload at "${path}"`)
       return this.filesBeingAdded.delete(path)
     }
