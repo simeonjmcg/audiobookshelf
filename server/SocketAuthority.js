@@ -120,6 +120,10 @@ class SocketAuthority {
       this.Server?.cancelLibraryScan(msg.libraryId)
       return
     }
+    if (msg.type === 'session_closed' && msg.sessionId) {
+      this.Server?.playbackSessionManager?.removeSessionLocally(msg.sessionId)
+      return
+    }
     if (msg.type === 'emitter') {
       if (msg.evt === 'task_started' && msg.data) {
         const TaskManager = require('./managers/TaskManager')

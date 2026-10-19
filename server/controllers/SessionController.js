@@ -388,17 +388,25 @@ class SessionController {
    * @param {Response} res
    * @param {NextFunction} next
    */
-  openSessionMiddleware(req, res, next) {
-    var playbackSession = this.playbackSessionManager.getSession(req.params.id)
-    if (!playbackSession) return res.sendStatus(404)
+  async openSessionMiddleware(req, res, next) {
+    try {
+      let playbackSession = this.playbackSessionManager.getSession(req.params.id)
+      if (!playbackSession) {
+        playbackSession = await this.playbackSessionManager.getOrLoadSession(req.params.id)
+      }
+      if (!playbackSession) return res.sendStatus(404)
 
-    if (playbackSession.userId !== req.user.id && !req.user.isAdminOrUp) {
-      Logger.error(`[SessionController] Non-admin user "${req.user.username}" attempting to access session belonging to another user "${req.params.id}"`)
-      return res.sendStatus(403)
+      if (playbackSession.userId !== req.user.id && !req.user.isAdminOrUp) {
+        Logger.error(`[SessionController] Non-admin user "${req.user.username}" attempting to access session belonging to another user "${req.params.id}"`)
+        return res.sendStatus(403)
+      }
+
+      req.playbackSession = playbackSession
+      next()
+    } catch (err) {
+      Logger.error(`[SessionController] Error in openSessionMiddleware for session "${req.params.id}":`, err)
+      res.sendStatus(500)
     }
-
-    req.playbackSession = playbackSession
-    next()
   }
 
   /**

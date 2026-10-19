@@ -35,12 +35,44 @@ class MiscController {
   initTusServer() {
     if (this.tusServer) return
 
-    const uploadDir = Path.join(global.MetadataPath, 'tmp', 'tus')
-    fs.ensureDirSync(uploadDir)
+    const gcsProvider = StorageManager.gcsProvider
+    const isGcs = Boolean(gcsProvider?.defaultBucketName && gcsProvider.storage)
+
+    let datastore
+    let uploadDir = null
+
+    if (isGcs) {
+      try {
+        const { GCSStore } = require('@tus/gcs-store')
+        const rawBucket = gcsProvider.getBucket(gcsProvider.defaultBucketName)
+        const bucketProxy = new Proxy(rawBucket, {
+          get(target, prop) {
+            if (prop === 'file') {
+              return (name, options) => {
+                const prefixed = String(name).startsWith('metadata/tmp/tus/') ? name : `metadata/tmp/tus/${name}`
+                return target.file(prefixed, options)
+              }
+            }
+            return typeof target[prop] === 'function' ? target[prop].bind(target) : target[prop]
+          }
+        })
+        datastore = new GCSStore({ bucket: bucketProxy })
+        Logger.info(`[MiscController] Tus server initialized with GCSStore on bucket "${gcsProvider.defaultBucketName}"`)
+      } catch (err) {
+        Logger.error('[MiscController] Failed to initialize GCSStore for Tus, falling back to local file store', err)
+      }
+    }
+
+    if (!datastore) {
+      uploadDir = Path.join(global.MetadataPath, 'tmp', 'tus')
+      fs.ensureDirSync(uploadDir)
+      datastore = new TusFileStore({ directory: uploadDir })
+      Logger.info(`[MiscController] Tus server initialized with TusFileStore at "${uploadDir}"`)
+    }
 
     this.tusServer = new TusServer({
       path: '/api/upload/tus',
-      datastore: new TusFileStore({ directory: uploadDir }),
+      datastore,
       respectForwardedHeaders: true,
       onUploadCreate: async (req, upload) => {
         const expressReq = req.node?.req || req
@@ -78,37 +110,65 @@ class MiscController {
           const library = await Database.libraryModel.findByIdWithFolders(libraryId)
           const folder = library.libraryFolders.find((fold) => fold.id === folderId)
 
-          const isGcs = StorageManager.isGcsPath(folder.path)
+          const isDestGcs = StorageManager.isGcsPath(folder.path)
           const outputDirectoryParts = library.isPodcast ? [title] : [author, series, title]
           const cleanedOutputDirectoryParts = outputDirectoryParts.filter(Boolean).map((part) => sanitizeFilename(part))
           const outputDirectory = StorageManager.join(folder.path, ...cleanedOutputDirectoryParts)
 
           const filePath = StorageManager.join(outputDirectory, sanitizeFilename(filename))
-
           const uploadId = upload.id
-          const tempFilePath = Path.join(uploadDir, uploadId)
 
           setImmediate(async () => {
             try {
               if (isGcs) {
-                const gcsProvider = StorageManager.getProvider(filePath)
-                const { bucketName, key } = gcsProvider.parsePath(filePath)
-                Logger.info(`[MiscController] Tus upload finished: uploading to gs://${bucketName}/${key}`)
-                await gcsProvider.getBucket(bucketName).upload(tempFilePath, {
-                  destination: key
-                })
-                await fs.remove(tempFilePath).catch(() => {})
-                await fs.remove(tempFilePath + '.info').catch(() => {})
-                Logger.info(`[MiscController] Tus upload finished: uploaded to ${filePath}`)
-              } else {
-                const hiddenFilePath = Path.join(outputDirectory, `.${sanitizeFilename(filename)}.tmp`)
-                await fs.ensureDir(outputDirectory)
-                await fs.move(tempFilePath, hiddenFilePath, { overwrite: true })
-                await fs.rename(hiddenFilePath, filePath)
+                const bucket = gcsProvider.getBucket(gcsProvider.defaultBucketName)
+                const sourceFile = bucket.file(`metadata/tmp/tus/${uploadId}`)
+                const patchFile = bucket.file(`metadata/tmp/tus/${uploadId}_patch`)
 
-                // remove .info file created by tus
-                await fs.remove(tempFilePath + '.info').catch(() => {})
-                Logger.info(`[MiscController] Tus upload finished: moved to ${filePath}`)
+                if (isDestGcs) {
+                  const { bucketName: destBucketName, key: destKey } = gcsProvider.parsePath(filePath)
+                  const destBucket = gcsProvider.getBucket(destBucketName)
+                  const destFile = destBucket.file(destKey)
+
+                  Logger.info(`[MiscController] Tus upload finished: copying gs://${gcsProvider.defaultBucketName}/metadata/tmp/tus/${uploadId} to gs://${destBucketName}/${destKey}`)
+                  await sourceFile.copy(destFile)
+                  await sourceFile.delete({ ignoreNotFound: true }).catch(() => {})
+                  await patchFile.delete({ ignoreNotFound: true }).catch(() => {})
+                  Logger.info(`[MiscController] Tus upload finished: copied to ${filePath}`)
+                } else {
+                  Logger.info(`[MiscController] Tus upload finished: streaming gs://${gcsProvider.defaultBucketName}/metadata/tmp/tus/${uploadId} to local ${filePath}`)
+                  await fs.ensureDir(outputDirectory)
+                  const hiddenFilePath = Path.join(outputDirectory, `.${sanitizeFilename(filename)}.tmp`)
+                  const writeStream = fs.createWriteStream(hiddenFilePath)
+                  const streamPipeline = require('stream/promises').pipeline
+                  await streamPipeline(sourceFile.createReadStream(), writeStream)
+                  await fs.rename(hiddenFilePath, filePath)
+                  await sourceFile.delete({ ignoreNotFound: true }).catch(() => {})
+                  await patchFile.delete({ ignoreNotFound: true }).catch(() => {})
+                  Logger.info(`[MiscController] Tus upload finished: saved to ${filePath}`)
+                }
+              } else {
+                const tempFilePath = Path.join(uploadDir, uploadId)
+                if (isDestGcs) {
+                  const destGcsProvider = StorageManager.getProvider(filePath)
+                  const { bucketName, key } = destGcsProvider.parsePath(filePath)
+                  Logger.info(`[MiscController] Tus upload finished: uploading to gs://${bucketName}/${key}`)
+                  await destGcsProvider.getBucket(bucketName).upload(tempFilePath, {
+                    destination: key
+                  })
+                  await fs.remove(tempFilePath).catch(() => {})
+                  await fs.remove(tempFilePath + '.info').catch(() => {})
+                  Logger.info(`[MiscController] Tus upload finished: uploaded to ${filePath}`)
+                } else {
+                  const hiddenFilePath = Path.join(outputDirectory, `.${sanitizeFilename(filename)}.tmp`)
+                  await fs.ensureDir(outputDirectory)
+                  await fs.move(tempFilePath, hiddenFilePath, { overwrite: true })
+                  await fs.rename(hiddenFilePath, filePath)
+
+                  // remove .info file created by tus
+                  await fs.remove(tempFilePath + '.info').catch(() => {})
+                  Logger.info(`[MiscController] Tus upload finished: moved to ${filePath}`)
+                }
               }
 
               // Manually trigger watcher since chokidar can miss hidden file renames across filesystems
@@ -120,7 +180,7 @@ class MiscController {
             }
           })
         } catch (error) {
-          Logger.error('[MiscController] Error starting background file move', error)
+          Logger.error('[MiscController] Error in onUploadFinish hook', error)
         }
         return {}
       }

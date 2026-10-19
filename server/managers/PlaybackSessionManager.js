@@ -18,7 +18,7 @@ const Stream = require('../objects/Stream')
 
 class PlaybackSessionManager {
   constructor() {
-    this.StreamsPath = Path.join(global.MetadataPath, 'streams')
+    this.StreamsPath = Path.join(global.MetadataPath || '', 'streams')
 
     this.oldPlaybackSessionMap = {} // TODO: Remove after updated mobile versions
 
@@ -35,6 +35,55 @@ class PlaybackSessionManager {
   getSession(sessionId) {
     return this.sessions.find((s) => s.id === sessionId)
   }
+
+  /**
+   * Get open session by id, or load it from database if created on another replica
+   *
+   * @param {string} sessionId
+   * @returns {Promise<PlaybackSession|null>}
+   */
+  async getOrLoadSession(sessionId) {
+    if (!sessionId) return null
+    let session = this.getSession(sessionId)
+    if (session) return session
+
+    try {
+      const dbSession = await Database.getPlaybackSession(sessionId)
+      if (!dbSession) return null
+
+      // Check if session was added while awaiting
+      session = this.getSession(sessionId)
+      if (session) return session
+
+      session = dbSession
+      session.lastSave = session.updatedAt || Date.now()
+
+      // If direct play and audioTracks are missing, populate from library item
+      if (session.playMethod === PlayMethod.DIRECTPLAY && (!session.audioTracks || !session.audioTracks.length) && session.libraryItemId) {
+        try {
+          const libraryItem = await Database.libraryItemModel.getExpandedById(session.libraryItemId)
+          if (libraryItem) {
+            session.audioTracks = libraryItem.getTrackList(session.episodeId)
+          }
+        } catch (e) {
+          Logger.warn(`[PlaybackSessionManager] Failed to populate audio tracks for loaded session ${sessionId}`, e)
+        }
+      }
+
+      this.sessions.push(session)
+      Logger.debug(`[PlaybackSessionManager] Loaded active session "${session.id}" from database into local memory`)
+      return session
+    } catch (err) {
+      Logger.error(`[PlaybackSessionManager] Failed to load session "${sessionId}" from database`, err)
+      return null
+    }
+  }
+
+  removeSessionLocally(sessionId) {
+    if (!sessionId) return
+    this.sessions = this.sessions.filter((s) => s.id !== sessionId)
+  }
+
   getUserSession(userId) {
     return this.sessions.find((s) => s.userId === userId)
   }
@@ -358,6 +407,14 @@ class PlaybackSessionManager {
     newPlaybackSession.audioTracks = audioTracks
 
     this.sessions.push(newPlaybackSession)
+    if (Database.isPostgresDialect?.()) {
+      try {
+        await Database.createPlaybackSession(newPlaybackSession)
+        newPlaybackSession.lastSave = Date.now()
+      } catch (err) {
+        Logger.error('[PlaybackSessionManager] Failed to persist initial playback session', err)
+      }
+    }
     SocketAuthority.adminEmitter('user_stream_update', user.toJSONForPublic(this.sessions))
 
     return newPlaybackSession
@@ -452,6 +509,7 @@ class PlaybackSessionManager {
       await session.stream.close()
     }
     this.sessions = this.sessions.filter((s) => s.id !== sessionId)
+    SocketAuthority.publishBroadcast({ type: 'session_closed', sessionId })
     Logger.debug(`[PlaybackSessionManager] Removed session "${sessionId}"`)
   }
 
