@@ -24,6 +24,124 @@ class PlaybackSessionManager {
 
     /** @type {PlaybackSession[]} */
     this.sessions = []
+    this.instanceId = uuidv4()
+    this.activeSessionsCleanupInterval = null
+  }
+
+  async initClusterActiveSessions() {
+    if (!Database.isPostgresDialect?.() || !Database.sequelize) return
+
+    try {
+      await Database.sequelize.query(`
+        CREATE UNLOGGED TABLE IF NOT EXISTS abs_active_sessions (
+          session_id VARCHAR(64) PRIMARY KEY,
+          instance_id VARCHAR(64) NOT NULL,
+          user_id VARCHAR(64) NOT NULL,
+          session_json JSONB NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_abs_active_sessions_inst ON abs_active_sessions (instance_id);
+        CREATE INDEX IF NOT EXISTS idx_abs_active_sessions_user ON abs_active_sessions (user_id);
+        CREATE INDEX IF NOT EXISTS idx_abs_active_sessions_updated ON abs_active_sessions (updated_at);
+      `)
+
+      await Database.sequelize.query(`DELETE FROM abs_active_sessions WHERE instance_id = :instanceId;`, {
+        replacements: { instanceId: this.instanceId }
+      })
+
+      this.activeSessionsCleanupInterval = setInterval(async () => {
+        try {
+          if (Database.sequelize) {
+            await Database.sequelize.query("DELETE FROM abs_active_sessions WHERE updated_at < NOW() - INTERVAL '36 hours';")
+          }
+        } catch (err) {
+          Logger.error('[PlaybackSessionManager] Failed to clean up stale active sessions', err)
+        }
+      }, 10 * 60 * 1000)
+      if (this.activeSessionsCleanupInterval.unref) this.activeSessionsCleanupInterval.unref()
+    } catch (err) {
+      Logger.error('[PlaybackSessionManager] Failed to initialize cluster active sessions table', err)
+    }
+  }
+
+  async recordActiveSession(session) {
+    if (!Database.isPostgresDialect?.() || !Database.sequelize || !session?.id) return
+    try {
+      const sessionJson = JSON.stringify(session.toJSON())
+      await Database.sequelize.query(
+        `INSERT INTO abs_active_sessions (session_id, instance_id, user_id, session_json, updated_at)
+         VALUES (:sessionId, :instanceId, :userId, :sessionJson, NOW())
+         ON CONFLICT (session_id) DO UPDATE SET
+           instance_id = EXCLUDED.instance_id,
+           user_id = EXCLUDED.user_id,
+           session_json = EXCLUDED.session_json,
+           updated_at = NOW();`,
+        {
+          replacements: {
+            sessionId: session.id,
+            instanceId: this.instanceId,
+            userId: session.userId,
+            sessionJson
+          }
+        }
+      )
+    } catch (err) {
+      Logger.error(`[PlaybackSessionManager] Failed to record active session "${session.id}"`, err)
+    }
+  }
+
+  async deleteActiveSession(sessionId) {
+    if (!Database.isPostgresDialect?.() || !Database.sequelize || !sessionId) return
+    try {
+      await Database.sequelize.query(`DELETE FROM abs_active_sessions WHERE session_id = :sessionId;`, {
+        replacements: { sessionId }
+      })
+    } catch (err) {
+      Logger.error(`[PlaybackSessionManager] Failed to delete active session "${sessionId}"`, err)
+    }
+  }
+
+  async getAllOpenSessions() {
+    if (Database.isPostgresDialect?.() && Database.sequelize) {
+      try {
+        const [rows] = await Database.sequelize.query(
+          `SELECT session_id, session_json, updated_at
+           FROM abs_active_sessions
+           WHERE updated_at > NOW() - INTERVAL '5 minutes'
+           ORDER BY updated_at DESC;`
+        )
+        if (rows && rows.length) {
+          const sessionMap = new Map()
+          for (const r of rows) {
+            const data = typeof r.session_json === 'string' ? JSON.parse(r.session_json) : r.session_json
+            sessionMap.set(data.id, new PlaybackSession(data))
+          }
+          for (const s of this.sessions) {
+            sessionMap.set(s.id, s)
+          }
+          return Array.from(sessionMap.values())
+        }
+      } catch (err) {
+        Logger.error('[PlaybackSessionManager] Failed to query cluster active sessions', err)
+      }
+    }
+    return this.sessions
+  }
+
+  async close() {
+    if (this.activeSessionsCleanupInterval) {
+      clearInterval(this.activeSessionsCleanupInterval)
+      this.activeSessionsCleanupInterval = null
+    }
+    if (Database.isPostgresDialect?.() && Database.sequelize) {
+      try {
+        await Database.sequelize.query(`DELETE FROM abs_active_sessions WHERE instance_id = :instanceId;`, {
+          replacements: { instanceId: this.instanceId }
+        })
+      } catch (err) {
+        Logger.error('[PlaybackSessionManager] Failed to clean up active sessions on close', err)
+      }
+    }
   }
 
   /**
@@ -82,6 +200,7 @@ class PlaybackSessionManager {
   removeSessionLocally(sessionId) {
     if (!sessionId) return
     this.sessions = this.sessions.filter((s) => s.id !== sessionId)
+    this.deleteActiveSession(sessionId).catch(() => {})
   }
 
   getUserSession(userId) {
@@ -411,11 +530,13 @@ class PlaybackSessionManager {
       try {
         await Database.createPlaybackSession(newPlaybackSession)
         newPlaybackSession.lastSave = Date.now()
+        await this.recordActiveSession(newPlaybackSession)
       } catch (err) {
         Logger.error('[PlaybackSessionManager] Failed to persist initial playback session', err)
       }
     }
-    SocketAuthority.adminEmitter('user_stream_update', user.toJSONForPublic(this.sessions))
+    const openSessions = await this.getAllOpenSessions()
+    SocketAuthority.adminEmitter('user_stream_update', user.toJSONForPublic(openSessions))
 
     return newPlaybackSession
   }
@@ -464,6 +585,11 @@ class PlaybackSessionManager {
       })
     }
     this.saveSession(session)
+    if (Database.isPostgresDialect?.()) {
+      this.recordActiveSession(session).catch((err) => {
+        Logger.error('[PlaybackSessionManager] Failed to record active session in sync', err)
+      })
+    }
 
     return true
   }
@@ -482,9 +608,10 @@ class PlaybackSessionManager {
       await this.saveSession(session)
     }
     Logger.debug(`[PlaybackSessionManager] closeSession "${session.id}"`)
-    SocketAuthority.adminEmitter('user_stream_update', user.toJSONForPublic(this.sessions))
+    await this.removeSession(session.id)
+    const openSessions = await this.getAllOpenSessions()
+    SocketAuthority.adminEmitter('user_stream_update', user.toJSONForPublic(openSessions))
     SocketAuthority.clientEmitter(session.userId, 'user_session_closed', session.id)
-    return this.removeSession(session.id)
   }
 
   saveSession(session) {
@@ -509,6 +636,7 @@ class PlaybackSessionManager {
       await session.stream.close()
     }
     this.sessions = this.sessions.filter((s) => s.id !== sessionId)
+    await this.deleteActiveSession(sessionId)
     SocketAuthority.publishBroadcast({ type: 'session_closed', sessionId })
     Logger.debug(`[PlaybackSessionManager] Removed session "${sessionId}"`)
   }
@@ -551,6 +679,13 @@ class PlaybackSessionManager {
       const sessionLastUpdate = new Date(session.updatedAt)
       Logger.info(`[PlaybackSessionManager] Closing stale session "${session.displayTitle}" (${session.id}) last updated at ${sessionLastUpdate}`)
       await this.removeSession(session.id)
+    }
+    if (Database.isPostgresDialect?.() && Database.sequelize) {
+      try {
+        await Database.sequelize.query("DELETE FROM abs_active_sessions WHERE updated_at < NOW() - INTERVAL '36 hours';")
+      } catch (err) {
+        Logger.error('[PlaybackSessionManager] Failed to clean up stale active sessions table', err)
+      }
     }
   }
 }

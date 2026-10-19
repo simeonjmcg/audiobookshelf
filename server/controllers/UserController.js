@@ -499,9 +499,11 @@ class UserController {
       return res.sendStatus(403)
     }
 
+    const openSessions = await this.playbackSessionManager.getAllOpenSessions()
+
     res.json({
       usersOnline: await SocketAuthority.getUsersOnline(),
-      openSessions: this.playbackSessionManager.sessions
+      openSessions
     })
   }
 

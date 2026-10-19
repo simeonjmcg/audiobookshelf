@@ -193,6 +193,7 @@ class Server {
     }
 
     await Database.init(false)
+    await this.playbackSessionManager.initClusterActiveSessions()
 
     if (typeof global.RouterBasePath !== 'string') {
       throw new Error('[Server] RouterBasePath must be a string before serving requests')
@@ -584,6 +585,7 @@ class Server {
     Watcher.close()
     Logger.info('[Server] Watcher Closed')
     await SocketAuthority.close()
+    await this.playbackSessionManager.close()
     Logger.info('[Server] Closing HTTP Server')
     await new Promise((resolve) => this.server.close(resolve))
     Logger.info('[Server] HTTP Server Closed')

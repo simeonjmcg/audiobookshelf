@@ -57,6 +57,7 @@ class SocketAuthority {
       }
     }
 
+    const activeSessions = (await this.Server?.playbackSessionManager?.getAllOpenSessions?.()) || this.Server?.playbackSessionManager?.sessions || []
     const onlineUsersMap = {}
     Object.values(this.clients)
       .filter((c) => c.user)
@@ -65,7 +66,7 @@ class SocketAuthority {
           onlineUsersMap[client.user.id].connections++
         } else {
           onlineUsersMap[client.user.id] = {
-            ...client.user.toJSONForPublic(this.Server?.playbackSessionManager?.sessions),
+            ...client.user.toJSONForPublic(activeSessions),
             connections: 1
           }
         }
@@ -73,10 +74,17 @@ class SocketAuthority {
     return Object.values(onlineUsersMap)
   }
 
+  async getUserJSONForPublic(user) {
+    if (!user) return null
+    const sessions = (await this.Server?.playbackSessionManager?.getAllOpenSessions?.()) || this.Server?.playbackSessionManager?.sessions || []
+    return user.toJSONForPublic(sessions)
+  }
+
   async recordSocketPresence(socketId, user) {
     if (!Database.isPostgresDialect?.() || !Database.sequelize || this.isClosing) return
     try {
-      const userJson = JSON.stringify(user.toJSONForPublic(this.Server?.playbackSessionManager?.sessions))
+      const publicUser = await this.getUserJSONForPublic(user)
+      const userJson = JSON.stringify(publicUser)
       await Database.sequelize.query(
         `INSERT INTO abs_socket_presences (socket_id, instance_id, user_id, user_json, updated_at)
          VALUES (:socketId, :instanceId, :userId, :userJson, NOW())
@@ -490,7 +498,7 @@ class SocketAuthority {
         socket.on('remove_log_listener', () => Logger.removeSocketListener(socket.id))
 
         // Sent automatically from socket.io clients
-        socket.on('disconnect', (reason) => {
+        socket.on('disconnect', async (reason) => {
           Logger.removeSocketListener(socket.id)
 
           const _client = this.clients[socket.id]
@@ -501,7 +509,8 @@ class SocketAuthority {
             delete this.clients[socket.id]
           } else {
             Logger.debug('[SocketAuthority] User Offline ' + _client.user.username)
-            this.adminEmitter('user_offline', _client.user.toJSONForPublic(this.Server.playbackSessionManager.sessions))
+            const publicUser = await this.getUserJSONForPublic(_client.user)
+            this.adminEmitter('user_offline', publicUser)
 
             const disconnectTime = Date.now() - _client.connected_at
             Logger.info(`[SocketAuthority] Socket ${socket.id} disconnected from client "${_client.user.username}" after ${disconnectTime}ms (Reason: ${reason})`)
@@ -627,7 +636,8 @@ class SocketAuthority {
 
     client.user = user
     await this.recordSocketPresence(socket.id, user)
-    this.adminEmitter('user_online', client.user.toJSONForPublic(this.Server.playbackSessionManager.sessions))
+    const publicUser = await this.getUserJSONForPublic(client.user)
+    this.adminEmitter('user_online', publicUser)
 
     // Update user lastSeen without firing sequelize bulk update hooks
     user.lastSeen = Date.now()

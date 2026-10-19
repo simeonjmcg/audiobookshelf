@@ -162,4 +162,125 @@ describe('PlaybackSessionManager Multi-Replica State Centralization', () => {
       expect(next.called).to.be.false
     })
   })
+
+  describe('Cluster Active Sessions (getAllOpenSessions, recordActiveSession, deleteActiveSession)', () => {
+    it('should return local sessions when not using Postgres dialect', async () => {
+      sinon.stub(Database, 'isPostgresDialect').returns(false)
+      const localSession = new PlaybackSession({ id: 'local-1', userId: 'user-1' })
+      playbackSessionManager.sessions.push(localSession)
+
+      const sessions = await playbackSessionManager.getAllOpenSessions()
+      expect(sessions).to.deep.equal([localSession])
+    })
+
+    it('should query abs_active_sessions and merge with local sessions on Postgres', async () => {
+      sinon.stub(Database, 'isPostgresDialect').returns(true)
+      const mockQuery = sinon.stub().resolves([
+        [
+          {
+            session_id: 'cluster-sess-1',
+            session_json: JSON.stringify({ id: 'cluster-sess-1', userId: 'user-cluster', displayTitle: 'Cluster Book' })
+          },
+          {
+            session_id: 'shared-sess-2',
+            session_json: JSON.stringify({ id: 'shared-sess-2', userId: 'user-2', displayTitle: 'Old Title' })
+          }
+        ]
+      ])
+      sinon.stub(Database, 'sequelize').value({ query: mockQuery })
+
+      const localSession = new PlaybackSession({ id: 'shared-sess-2', userId: 'user-2', displayTitle: 'Fresh Local Title' })
+      playbackSessionManager.sessions.push(localSession)
+
+      const sessions = await playbackSessionManager.getAllOpenSessions()
+      expect(sessions).to.have.lengthOf(2)
+      const shared = sessions.find((s) => s.id === 'shared-sess-2')
+      expect(shared.displayTitle).to.equal('Fresh Local Title')
+      const clusterOnly = sessions.find((s) => s.id === 'cluster-sess-1')
+      expect(clusterOnly.userId).to.equal('user-cluster')
+    })
+
+    it('should record active session into abs_active_sessions on Postgres', async () => {
+      sinon.stub(Database, 'isPostgresDialect').returns(true)
+      const mockQuery = sinon.stub().resolves()
+      sinon.stub(Database, 'sequelize').value({ query: mockQuery })
+
+      const session = new PlaybackSession({ id: 'sess-rec-1', userId: 'user-1' })
+      await playbackSessionManager.recordActiveSession(session)
+
+      expect(mockQuery.calledOnce).to.be.true
+      const [sql, options] = mockQuery.firstCall.args
+      expect(sql).to.include('INSERT INTO abs_active_sessions')
+      expect(options.replacements.sessionId).to.equal('sess-rec-1')
+      expect(options.replacements.userId).to.equal('user-1')
+    })
+
+    it('should delete active session from abs_active_sessions on Postgres', async () => {
+      sinon.stub(Database, 'isPostgresDialect').returns(true)
+      const mockQuery = sinon.stub().resolves()
+      sinon.stub(Database, 'sequelize').value({ query: mockQuery })
+
+      await playbackSessionManager.deleteActiveSession('sess-del-1')
+
+      expect(mockQuery.calledOnce).to.be.true
+      const [sql, options] = mockQuery.firstCall.args
+      expect(sql).to.include('DELETE FROM abs_active_sessions WHERE session_id = :sessionId')
+      expect(options.replacements.sessionId).to.equal('sess-del-1')
+    })
+  })
+
+  describe('SessionController cluster session queries', () => {
+    it('getOpenSessions should return cluster-wide active sessions with user details', async () => {
+      const mockSession = new PlaybackSession({ id: 'sess-all-1', userId: 'u-1', displayTitle: 'My Book' })
+      sinon.stub(playbackSessionManager, 'getAllOpenSessions').resolves([mockSession])
+      sinon.stub(Database, 'userModel').value({
+        getMinifiedUserObjects: sinon.stub().resolves([{ id: 'u-1', username: 'alice' }])
+      })
+
+      const req = {
+        user: { isAdminOrUp: true, username: 'admin' }
+      }
+      const res = {
+        json: sinon.spy(),
+        sendStatus: sinon.spy()
+      }
+
+      const context = { playbackSessionManager }
+      await SessionController.getOpenSessions.call(context, req, res)
+
+      expect(res.json.calledOnce).to.be.true
+      const responseData = res.json.firstCall.args[0]
+      expect(responseData.sessions).to.have.lengthOf(1)
+      expect(responseData.sessions[0].id).to.equal('sess-all-1')
+      expect(responseData.sessions[0].user).to.deep.equal({ id: 'u-1', username: 'alice' })
+    })
+
+    it('getTrack should load session via getOrLoadSession if not in local memory', async () => {
+      const dbSession = new PlaybackSession({
+        id: 'sess-track-1',
+        userId: 'u-1',
+        audioTracks: [{ index: 1, metadata: { path: '/path/to/track.mp3' } }]
+      })
+      sinon.stub(playbackSessionManager, 'getOrLoadSession').withArgs('sess-track-1').resolves(dbSession)
+      sinon.stub(Database, 'userModel').value({
+        getUserById: sinon.stub().resolves({ id: 'u-1', username: 'alice' })
+      })
+
+      const req = {
+        params: { id: 'sess-track-1', index: '1' }
+      }
+      const res = {
+        sendStatus: sinon.spy()
+      }
+
+      // Mock audio track streaming or check that session was resolved
+      const context = {
+        playbackSessionManager,
+        streamAudioFile: sinon.stub().resolves()
+      }
+      await SessionController.getTrack.call(context, req, res)
+
+      expect(playbackSessionManager.getOrLoadSession.calledWith('sess-track-1')).to.be.true
+    })
+  })
 })

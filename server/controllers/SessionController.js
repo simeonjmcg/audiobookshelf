@@ -126,7 +126,8 @@ class SessionController {
     }
 
     const minifiedUserObjects = await Database.userModel.getMinifiedUserObjects()
-    const openSessions = this.playbackSessionManager.sessions.map((se) => {
+    const openSessionsObjects = await this.playbackSessionManager.getAllOpenSessions()
+    const openSessions = openSessionsObjects.map((se) => {
       return {
         ...se.toJSON(),
         user: minifiedUserObjects.find((u) => u.id === se.userId) || null
@@ -283,7 +284,10 @@ class SessionController {
       return res.sendStatus(400)
     }
 
-    const playbackSession = this.playbackSessionManager.getSession(req.params.id)
+    let playbackSession = this.playbackSessionManager.getSession(req.params.id)
+    if (!playbackSession) {
+      playbackSession = await this.playbackSessionManager.getOrLoadSession(req.params.id)
+    }
     if (!playbackSession) {
       Logger.error(`[SessionController] Unable to find playback session with id=${req.params.id}`)
       return res.sendStatus(404)
