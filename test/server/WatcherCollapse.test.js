@@ -148,11 +148,16 @@ describe('Watcher Event Collapsing', () => {
 
     folderWatcher.collapsePendingFileUpdates()
 
-    expect(folderWatcher.pendingFileUpdates).to.have.length(1)
-    const update = folderWatcher.pendingFileUpdates[0]
-    expect(update.path).to.equal('gcs://smcgraw-abs-lib/audiobooks/Author/NewDir/track01.mp3')
+    expect(folderWatcher.pendingFileUpdates).to.have.length(2)
+    const update = folderWatcher.pendingFileUpdates.find((u) => u.path === 'gcs://smcgraw-abs-lib/audiobooks/Author/NewDir/track01.mp3')
+    expect(update).to.exist
     expect(update.oldPath).to.equal('gcs://smcgraw-abs-lib/audiobooks/Author/OldDir/track01.mp3')
     expect(update.type).to.equal('renamed')
+
+    const sourceDirUpdate = folderWatcher.pendingFileUpdates.find((u) => u.path === 'gcs://smcgraw-abs-lib/audiobooks/Author/OldDir')
+    expect(sourceDirUpdate).to.exist
+    expect(sourceDirUpdate.type).to.equal('updated')
+    expect(sourceDirUpdate.isDir).to.be.true
   })
 
   it('cancels file added and immediately deleted during debounce window', () => {

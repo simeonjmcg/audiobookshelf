@@ -521,16 +521,40 @@ class FolderWatcher extends EventEmitter {
         }
       }
 
-      // Case 3c: Matching filename moved across directories (same folderId)
+      // Case 3c: Matching filename moved across directories (same library)
       for (const add of addedUpdates) {
         if (add.type === 'renamed') continue
         const addFilename = Path.basename(add.path)
-        const matchingDel = deletedUpdates.find((d) => !pairedDeletedPaths.has(d.path) && Path.basename(d.path) === addFilename && d.folderId === add.folderId)
+        const matchingDel = deletedUpdates.find((d) => !pairedDeletedPaths.has(d.path) && Path.basename(d.path) === addFilename && d.libraryId === add.libraryId)
         if (matchingDel) {
           Logger.debug(`[Watcher] Collapsing cross-dir file move into rename: "${matchingDel.path}" => "${add.path}"`)
           add.type = 'renamed'
           add.oldPath = matchingDel.path
           pairedDeletedPaths.add(matchingDel.path)
+
+          // If moved from a different directory, ensure the source directory is rescanned
+          // to refresh its tracks (in case other files remain in that directory)
+          const oldDir = Path.dirname(matchingDel.path)
+          const newDir = Path.dirname(add.path)
+          if (oldDir !== newDir) {
+            const hasOldDirUpdate = this.pendingFileUpdates.some((u) => !pairedDeletedPaths.has(u.path) && (u.path === oldDir || u.path.startsWith(oldDir + '/')))
+            if (!hasOldDirUpdate) {
+              const oldLibWatcher = this.libraryWatchers.find((lw) => lw.id === matchingDel.libraryId)
+              const oldFolder = oldLibWatcher?.libraryFolders?.find((f) => isSameOrSubPath(f.path, oldDir))
+              if (oldFolder) {
+                const folderPath = filePathToPOSIX(oldFolder.path)
+                const relPath = oldDir.replace(folderPath, '')
+                this.pendingFileUpdates.push({
+                  path: oldDir,
+                  relPath,
+                  folderId: oldFolder.id,
+                  libraryId: matchingDel.libraryId,
+                  type: 'updated',
+                  isDir: true
+                })
+              }
+            }
+          }
         }
       }
 
