@@ -93,4 +93,39 @@ describe('GcsWatcher', () => {
     expect(ackSpy.calledOnce).to.be.true
     expect(mockFolderWatcher.onFileAdded.called).to.be.false
   })
+
+  it('handles storage.folders.rename Cloud Audit Log events', async () => {
+    const ackSpy = sinon.spy()
+    const auditPayload = {
+      protoPayload: {
+        methodName: 'storage.folders.rename',
+        resourceName: 'projects/_/buckets/smcgraw-abs-lib/folders/audiobooks/OldAuthor/',
+        authorizationInfo: [
+          {
+            permission: 'storage.folders.create',
+            resource: 'projects/_/buckets/smcgraw-abs-lib/folders/audiobooks/NewAuthor/'
+          },
+          {
+            permission: 'storage.folders.rename',
+            resource: 'projects/_/buckets/smcgraw-abs-lib/folders/audiobooks/OldAuthor/'
+          }
+        ]
+      }
+    }
+    const message = {
+      data: Buffer.from(JSON.stringify(auditPayload)).toString('base64'),
+      ack: ackSpy
+    }
+
+    await gcsWatcher.handleMessage(message)
+
+    expect(ackSpy.calledOnce).to.be.true
+    expect(mockFolderWatcher.onFileRemoved.calledOnce).to.be.true
+    expect(mockFolderWatcher.onFileRemoved.firstCall.args[0]).to.equal('lib_1')
+    expect(mockFolderWatcher.onFileRemoved.firstCall.args[1]).to.equal('gcs://smcgraw-abs-lib/audiobooks/OldAuthor')
+
+    expect(mockFolderWatcher.onFileAdded.calledOnce).to.be.true
+    expect(mockFolderWatcher.onFileAdded.firstCall.args[0]).to.equal('lib_1')
+    expect(mockFolderWatcher.onFileAdded.firstCall.args[1]).to.equal('gcs://smcgraw-abs-lib/audiobooks/NewAuthor')
+  })
 })

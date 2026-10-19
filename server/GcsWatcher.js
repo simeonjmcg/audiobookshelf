@@ -75,6 +75,13 @@ class GcsWatcher {
         }
       }
 
+      // Case 1: Cloud Audit Log event for atomic folder rename (HNS buckets)
+      if (data.protoPayload?.methodName === 'storage.folders.rename') {
+        await this.handleFolderRenameAuditLog(data)
+        message.ack()
+        return
+      }
+
       const eventType = message.attributes?.eventType || data.kind || ''
       const bucketName = message.attributes?.bucketId || data.bucket
       const objectId = message.attributes?.objectId || data.name
@@ -157,6 +164,73 @@ class GcsWatcher {
     }
 
     return null
+  }
+
+  /**
+   * Parse Cloud Audit Log for storage.folders.rename event
+   * Resources are in format: projects/_/buckets/{bucketName}/folders/{folderPath}/
+   * @param {any} data
+   */
+  async handleFolderRenameAuditLog(data) {
+    try {
+      const authInfo = data.protoPayload?.authorizationInfo || []
+      let srcResource = ''
+      let destResource = ''
+
+      for (const info of authInfo) {
+        if (info.permission === 'storage.folders.rename') {
+          srcResource = info.resource || ''
+        } else if (info.permission === 'storage.folders.create') {
+          destResource = info.resource || ''
+        }
+      }
+
+      if (!srcResource && data.protoPayload?.resourceName) {
+        srcResource = data.protoPayload.resourceName
+      }
+
+      Logger.info(`[GcsWatcher] Detected HNS folder rename: "${srcResource}" -> "${destResource}"`)
+
+      // Parse bucket and relative folder paths from resource names
+      // Format: projects/_/buckets/<bucket>/folders/<path>/
+      const parseResource = (res) => {
+        if (!res) return null
+        const match = res.match(/buckets\/([^\/]+)\/folders\/(.+)$/)
+        if (!match) return null
+        let folderPath = match[2]
+        if (folderPath.endsWith('/')) folderPath = folderPath.slice(0, -1)
+        return { bucket: match[1], path: `gcs://${match[1]}/${folderPath}` }
+      }
+
+      const src = parseResource(srcResource)
+      const dest = parseResource(destResource)
+
+      // Invalidate stat cache
+      if (src && StorageManager.clearStatCache) StorageManager.clearStatCache(src.path)
+      if (dest && StorageManager.clearStatCache) StorageManager.clearStatCache(dest.path)
+
+      // Find library matching either source or destination
+      const srcMatch = src ? this.findMatchingLibraryAndFolder(src.path) : null
+      const destMatch = dest ? this.findMatchingLibraryAndFolder(dest.path) : null
+
+      const match = destMatch || srcMatch
+      if (!match) {
+        Logger.debug(`[GcsWatcher] Folder rename paths do not match any library: src="${src?.path}", dest="${dest?.path}"`)
+        return
+      }
+
+      const { library, folder } = match
+
+      // Queue file updates on the renamed folder so Scanner rescans the changed directory
+      if (src && srcMatch) {
+        this.folderWatcher.onFileRemoved(library.id, src.path)
+      }
+      if (dest && destMatch) {
+        this.folderWatcher.onFileAdded(library.id, dest.path)
+      }
+    } catch (err) {
+      Logger.error(`[GcsWatcher] Failed to handle folder rename audit log: ${err.message}`)
+    }
   }
 
   /**
