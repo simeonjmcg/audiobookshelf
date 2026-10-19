@@ -5,7 +5,8 @@ const Logger = require('./Logger')
 const Task = require('./objects/Task')
 const TaskManager = require('./managers/TaskManager')
 
-const { filePathToPOSIX, isSameOrSubPath, getFileMTimeMs, shouldIgnoreFile } = require('./utils/fileUtils')
+const GcsWatcher = require('./GcsWatcher')
+const { filePathToPOSIX, isSameOrSubPath, isGcsPath, getFileMTimeMs, shouldIgnoreFile } = require('./utils/fileUtils')
 
 /**
  * @typedef PendingFileUpdate
@@ -40,6 +41,8 @@ class FolderWatcher extends EventEmitter {
     this.removeFromIgnoreTimer = null
 
     this.disabled = false
+
+    this.gcsWatcher = new GcsWatcher(this)
   }
 
   get pendingFilePaths() {
@@ -58,39 +61,49 @@ class FolderWatcher extends EventEmitter {
     Logger.info(`[Watcher] Initializing watcher for "${library.name}".`)
 
     const folderPaths = library.libraryFolders.map((f) => f.path)
-    folderPaths.forEach((fp) => {
-      Logger.debug(`[Watcher] Init watcher for library folder path "${fp}"`)
+    const localFolderPaths = folderPaths.filter((fp) => !fileUtils.isGcsPath(fp))
+    const gcsFolderPaths = folderPaths.filter((fp) => fileUtils.isGcsPath(fp))
+
+    localFolderPaths.forEach((fp) => {
+      Logger.debug(`[Watcher] Init local fs watcher for library folder path "${fp}"`)
     })
-    const watcher = new Watcher(folderPaths, {
-      ignored: /(^|[\/\\])\../, // ignore dotfiles
-      renameDetection: true,
-      renameTimeout: 2000,
-      recursive: true,
-      ignoreInitial: true,
-      persistent: true
+    gcsFolderPaths.forEach((fp) => {
+      Logger.debug(`[Watcher] Init GCS Pub/Sub watcher for library folder path "${fp}"`)
     })
-    watcher
-      .on('add', (path) => {
-        this.onFileAdded(library.id, filePathToPOSIX(path))
+
+    let watcher = null
+    if (localFolderPaths.length) {
+      watcher = new Watcher(localFolderPaths, {
+        ignored: /(^|[\/\\])\../, // ignore dotfiles
+        renameDetection: true,
+        renameTimeout: 2000,
+        recursive: true,
+        ignoreInitial: true,
+        persistent: true
       })
-      .on('change', (path) => {
-        // This is triggered from metadata changes, not what we want
-      })
-      .on('unlink', (path) => {
-        this.onFileRemoved(library.id, filePathToPOSIX(path))
-      })
-      .on('rename', (path, pathNext) => {
-        this.onFileRename(library.id, filePathToPOSIX(path), filePathToPOSIX(pathNext))
-      })
-      .on('error', (error) => {
-        Logger.error(`[Watcher] ${error}`)
-      })
-      .on('ready', () => {
-        Logger.info(`[Watcher] "${library.name}" Ready`)
-      })
-      .on('close', () => {
-        Logger.debug(`[Watcher] "${library.name}" Closed`)
-      })
+      watcher
+        .on('add', (path) => {
+          this.onFileAdded(library.id, filePathToPOSIX(path))
+        })
+        .on('change', (path) => {
+          // This is triggered from metadata changes, not what we want
+        })
+        .on('unlink', (path) => {
+          this.onFileRemoved(library.id, filePathToPOSIX(path))
+        })
+        .on('rename', (path, pathNext) => {
+          this.onFileRename(library.id, filePathToPOSIX(path), filePathToPOSIX(pathNext))
+        })
+        .on('error', (error) => {
+          Logger.error(`[Watcher] ${error}`)
+        })
+        .on('ready', () => {
+          Logger.info(`[Watcher] "${library.name}" Ready`)
+        })
+        .on('close', () => {
+          Logger.debug(`[Watcher] "${library.name}" Closed`)
+        })
+    }
 
     this.libraryWatchers.push({
       id: library.id,
@@ -111,6 +124,10 @@ class FolderWatcher extends EventEmitter {
         this.buildLibraryWatcher(lib)
       }
     })
+
+    if (this.gcsWatcher) {
+      this.gcsWatcher.init()
+    }
   }
 
   /**
@@ -134,7 +151,7 @@ class FolderWatcher extends EventEmitter {
       // Library watcher was disabled
       if (library.settings.disableWatcher) {
         Logger.info(`[Watcher] updateLibrary: Library "${library.name}" watcher disabled`)
-        libwatcher.watcher.close()
+        if (libwatcher.watcher) libwatcher.watcher.close()
         this.libraryWatchers = this.libraryWatchers.filter((lw) => lw.id !== libwatcher.id)
         return
       }
@@ -148,7 +165,7 @@ class FolderWatcher extends EventEmitter {
       if (pathsToAdd.length || pathsRemoved.length) {
         Logger.info(`[Watcher] Re-Initializing watcher for "${library.name}".`)
 
-        libwatcher.watcher.close()
+        if (libwatcher.watcher) libwatcher.watcher.close()
         this.libraryWatchers = this.libraryWatchers.filter((lw) => lw.id !== libwatcher.id)
         this.buildLibraryWatcher(library)
       }
@@ -168,7 +185,7 @@ class FolderWatcher extends EventEmitter {
     var libwatcher = this.libraryWatchers.find((lib) => lib.id === library.id)
     if (libwatcher) {
       Logger.info(`[Watcher] Removed watcher for "${library.name}"`)
-      libwatcher.watcher.close()
+      if (libwatcher.watcher) libwatcher.watcher.close()
       this.libraryWatchers = this.libraryWatchers.filter((lib) => lib.id !== library.id)
     } else {
       Logger.error(`[Watcher] Library watcher not found for "${library.name}"`)
@@ -176,7 +193,10 @@ class FolderWatcher extends EventEmitter {
   }
 
   close() {
-    return this.libraryWatchers.map((lib) => lib.watcher.close())
+    if (this.gcsWatcher) {
+      this.gcsWatcher.close()
+    }
+    return this.libraryWatchers.filter((lib) => !!lib.watcher).map((lib) => lib.watcher.close())
   }
 
   /**
@@ -237,6 +257,12 @@ class FolderWatcher extends EventEmitter {
    * @param {number} [loop=0]
    */
   async waitForFileToAdd(path, lastMTimeMs = 0, loop = 0) {
+    // For GCS objects, OBJECT_FINALIZE is only fired when the object upload is already completely finalized
+    if (fileUtils.isGcsPath(path)) {
+      Logger.debug(`[Watcher] GCS file finalized upload at "${path}"`)
+      return this.filesBeingAdded.delete(path)
+    }
+
     // Safety to catch infinite loop (600s)
     if (loop >= 200) {
       Logger.warn(`[Watcher] Waiting to add file at "${path}" timeout (loop ${loop}) - bailing`)
