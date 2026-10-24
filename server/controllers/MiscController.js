@@ -37,9 +37,10 @@ class MiscController {
     const isGcs = Boolean(gcsProvider?.defaultBucketName && gcsProvider.storage)
 
     let datastore
-    let uploadDir = null
 
-    if (isGcs) {
+    const stageLocal = process.env.TUS_STAGE_LOCAL === 'true' || process.env.TUS_DATASTORE === 'file'
+
+    if (isGcs && !stageLocal) {
       try {
         const { GCSStore } = require('@tus/gcs-store')
         const rawBucket = gcsProvider.getBucket(gcsProvider.defaultBucketName)
@@ -61,13 +62,16 @@ class MiscController {
       }
     }
 
+    const uploadDir = Path.join(global.MetadataPath, 'tmp', 'tus')
+
     if (!datastore) {
-      uploadDir = Path.join(global.MetadataPath, 'tmp', 'tus')
       fs.ensureDirSync(uploadDir)
       const { FileStore: TusFileStore } = require('@tus/file-store')
       datastore = new TusFileStore({ directory: uploadDir })
       Logger.info(`[MiscController] Tus server initialized with TusFileStore at "${uploadDir}"`)
     }
+
+    const isTusGcs = Boolean(datastore && datastore.constructor && datastore.constructor.name === 'GCSStore')
 
     const { Server: TusServer } = require('@tus/server')
     this.tusServer = new TusServer({
@@ -120,7 +124,7 @@ class MiscController {
 
           setImmediate(async () => {
             try {
-              if (isGcs) {
+              if (isTusGcs) {
                 const bucket = gcsProvider.getBucket(gcsProvider.defaultBucketName)
                 const sourceFile = bucket.file(`metadata/tmp/tus/${uploadId}`)
                 const patchFile = bucket.file(`metadata/tmp/tus/${uploadId}_patch`)
