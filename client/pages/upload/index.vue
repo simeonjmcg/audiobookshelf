@@ -377,8 +377,8 @@ export default {
             }
           }
 
-          // Enforce 25MB chunk size so uploads safely pass through reverse proxies and Cloudflare (100MB body limit)
-          uploadOpts.chunkSize = 25 * 1024 * 1024
+          // Enforce 95MB chunk size so uploads safely pass through reverse proxies and Cloudflare (100MB body limit)
+          uploadOpts.chunkSize = 95 * 1024 * 1024
 
           const upload = new tus.Upload(file, uploadOpts)
           this.activeUploads.push(upload)
