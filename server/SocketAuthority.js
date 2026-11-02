@@ -363,6 +363,13 @@ class SocketAuthority {
         try {
           if (!this.isClosing && Database.sequelize) {
             await Database.sequelize.query("DELETE FROM abs_broadcast_events WHERE created_at < NOW() - INTERVAL '5 minutes';")
+            const localSocketIds = Object.keys(this.clients).filter((id) => this.clients[id]?.user)
+            if (localSocketIds.length > 0) {
+              await Database.sequelize.query(
+                `UPDATE abs_socket_presences SET updated_at = NOW() WHERE socket_id IN (:socketIds);`,
+                { replacements: { socketIds: localSocketIds } }
+              )
+            }
             await Database.sequelize.query("DELETE FROM abs_socket_presences WHERE updated_at < NOW() - INTERVAL '10 minutes';")
           }
         } catch (err) {
@@ -446,7 +453,9 @@ class SocketAuthority {
       cors: {
         origin: '*',
         methods: ['GET', 'POST']
-      }
+      },
+      pingInterval: 15000,
+      pingTimeout: 20000
     }
 
     const ioServer = new SocketIO.Server(Server.server, socketIoOptions)

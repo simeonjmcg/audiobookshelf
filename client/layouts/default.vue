@@ -38,7 +38,8 @@ export default {
       socketConnectionToastId: null,
       currentLang: null,
       multiSessionOtherSessionId: null, // Used for multiple sessions open warning toast
-      multiSessionCurrentSessionId: null // Used for multiple sessions open warning toast
+      multiSessionCurrentSessionId: null, // Used for multiple sessions open warning toast
+      disconnectToastTimeout: null
     }
   },
   watch: {
@@ -110,6 +111,10 @@ export default {
     },
     connect() {
       console.log('[SOCKET] Connected')
+      if (this.disconnectToastTimeout) {
+        clearTimeout(this.disconnectToastTimeout)
+        this.disconnectToastTimeout = null
+      }
       var token = this.$store.getters['user/getToken']
       this.socket.emit('auth', token)
 
@@ -121,15 +126,39 @@ export default {
     },
     connectError() {
       console.error('[SOCKET] connect error')
+      if (this.disconnectToastTimeout) {
+        clearTimeout(this.disconnectToastTimeout)
+        this.disconnectToastTimeout = null
+      }
       this.updateSocketConnectionToast(this.$strings.ToastSocketFailedToConnect, 'error', null)
     },
     disconnect() {
       console.log('[SOCKET] Disconnected')
       this.isSocketConnected = false
-      this.updateSocketConnectionToast(this.$strings.ToastSocketDisconnected, 'error', null)
+      this.isSocketAuthenticated = false
+      if (this.disconnectToastTimeout) {
+        clearTimeout(this.disconnectToastTimeout)
+      }
+      // Give 4-second grace period for auto-reconnection before showing an error toast
+      this.disconnectToastTimeout = setTimeout(() => {
+        if (!this.isSocketConnected) {
+          this.updateSocketConnectionToast(this.$strings.ToastSocketDisconnected, 'error', null)
+        }
+      }, 4000)
     },
     reconnect() {
       console.log('[SOCKET] reconnected')
+      if (this.disconnectToastTimeout) {
+        clearTimeout(this.disconnectToastTimeout)
+        this.disconnectToastTimeout = null
+      }
+      var token = this.$store.getters['user/getToken']
+      if (token && this.socket) {
+        this.socket.emit('auth', token)
+      }
+      if (this.socketConnectionToastId !== null) {
+        this.updateSocketConnectionToast(this.$strings.ToastSocketConnected, 'success', 5000)
+      }
     },
     reconnectAttempt(val) {
       console.log(`[SOCKET] reconnect attempt ${val}`)
@@ -139,10 +168,43 @@ export default {
     },
     reconnectFailed() {
       console.error('[SOCKET] reconnect failed')
+      if (this.disconnectToastTimeout) {
+        clearTimeout(this.disconnectToastTimeout)
+        this.disconnectToastTimeout = null
+      }
+      this.updateSocketConnectionToast(this.$strings.ToastSocketFailedToConnect, 'error', null)
     },
-    authFailed(payload) {
-      console.error('[SOCKET] auth failed', payload.message)
+    async authFailed(payload) {
+      console.error('[SOCKET] auth failed', payload?.message)
       this.isSocketAuthenticated = false
+      if (payload?.message === 'Token expired' || payload?.message === 'Invalid token') {
+        try {
+          console.log('[SOCKET] Attempting token refresh after auth_failed...')
+          const newAccessToken = await this.$store.dispatch('user/refreshToken')
+          if (newAccessToken && this.socket && this.isSocketConnected) {
+            console.log('[SOCKET] Re-authenticating socket with refreshed token')
+            this.socket.emit('auth', newAccessToken)
+          }
+        } catch (err) {
+          console.error('[SOCKET] Failed to refresh token after auth_failed', err)
+        }
+      }
+    },
+    handleVisibilityChange() {
+      if (document.visibilityState === 'visible') {
+        if (this.socket) {
+          if (!this.socket.connected) {
+            console.log('[SOCKET] Tab became visible and socket disconnected, connecting...')
+            this.socket.connect()
+          } else if (!this.isSocketAuthenticated) {
+            console.log('[SOCKET] Tab became visible and socket unauthenticated, authenticating...')
+            const token = this.$store.getters['user/getToken']
+            if (token) {
+              this.socket.emit('auth', token)
+            }
+          }
+        }
+      }
     },
     init(payload) {
       console.log('Init Payload', payload)
@@ -611,6 +673,8 @@ export default {
     this.$eventBus.$on('token_refreshed', this.tokenRefreshed)
     window.addEventListener('resize', this.resize)
     window.addEventListener('keydown', this.keyDown)
+    document.addEventListener('visibilitychange', this.handleVisibilityChange)
+    window.addEventListener('focus', this.handleVisibilityChange)
 
     this.$store.dispatch('libraries/load')
 
@@ -635,6 +699,12 @@ export default {
     this.$eventBus.$off('token_refreshed', this.tokenRefreshed)
     window.removeEventListener('resize', this.resize)
     window.removeEventListener('keydown', this.keyDown)
+    document.removeEventListener('visibilitychange', this.handleVisibilityChange)
+    window.removeEventListener('focus', this.handleVisibilityChange)
+    if (this.disconnectToastTimeout) {
+      clearTimeout(this.disconnectToastTimeout)
+      this.disconnectToastTimeout = null
+    }
   }
 }
 </script>
