@@ -16,3 +16,8 @@ Please add a record of every database migration that you create to this file. Th
 | v2.19.1        | v2.19.1-copy-title-to-library-items          | Copies title and titleIgnorePrefix to the libraryItems table, creates update triggers and indices             |
 | v2.19.4        | v2.19.4-improve-podcast-queries              | Adds numEpisodes to podcasts, adds podcastId to mediaProgresses, copies podcast title to libraryItems         |
 | v2.20.0        | v2.20.0-improve-author-sort-queries          | Adds AuthorNames(FirstLast\|LastFirst) to libraryItems to improve author sort queries                         |
+| v2.26.0        | v2.26.0-create-auth-tables                   | Creates sessions and apiKeys tables                                                                           |
+| v2.33.0        | v2.33.0-add-discover-query-indexes           | Adds performance indexes for discover query                                                                   |
+| v2.35.0        | v2.35.0-add-last-refresh-token               | Adds lastRefreshToken and lastRefreshTokenExpiresAt to sessions                                               |
+| v2.36.0        | v2.36.0-widen-token-columns                  | Widens session and user token columns to TEXT on postgres                                                     |
+| v2.37.0        | v2.37.0-create-pubsub-tables                 | Creates unlogged tables for postgres cross-replica pub/sub events and socket presences                         |

@@ -335,26 +335,6 @@ class SocketAuthority {
     if (!Database.isPostgresDialect?.() || !process.env.DATABASE_URL) return
 
     try {
-      await Database.sequelize.query(`
-        CREATE UNLOGGED TABLE IF NOT EXISTS abs_broadcast_events (
-          id BIGSERIAL PRIMARY KEY,
-          origin VARCHAR(64) NOT NULL,
-          payload JSONB NOT NULL,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-        CREATE INDEX IF NOT EXISTS idx_abs_broadcast_events_created ON abs_broadcast_events (created_at);
-
-        CREATE UNLOGGED TABLE IF NOT EXISTS abs_socket_presences (
-          socket_id VARCHAR(64) PRIMARY KEY,
-          instance_id VARCHAR(64) NOT NULL,
-          user_id VARCHAR(64) NOT NULL,
-          user_json JSONB NOT NULL,
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-        CREATE INDEX IF NOT EXISTS idx_abs_socket_presences_inst ON abs_socket_presences (instance_id);
-        CREATE INDEX IF NOT EXISTS idx_abs_socket_presences_user ON abs_socket_presences (user_id);
-      `)
-
       await Database.sequelize.query(`DELETE FROM abs_socket_presences WHERE instance_id = :instanceId;`, {
         replacements: { instanceId: this.instanceId }
       })
